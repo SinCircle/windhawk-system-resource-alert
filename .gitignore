@@ -1,0 +1,9 @@
+# Publication allowlist: local work, captures, dumps and binaries stay private.
+*
+!.gitignore
+!.gitattributes
+!README.md
+!LICENSE
+!PRIVACY.md
+!THIRD_PARTY_NOTICES.md
+!system-resource-alert.wh.cpp
