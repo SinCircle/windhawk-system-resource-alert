@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.8.0
+// @version         0.8.1
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -1816,18 +1816,21 @@ struct NativePanel {
                     Controls::Grid labelHost;
                     labelHost.VerticalAlignment(VerticalAlignment::Center);
                     labelHost.Margin(Thickness{0, 0, 8, 0});
-                    Controls::ColumnDefinition expanderColumn;
-                    expanderColumn.Width(GridLength{data->gpuSummary ? 12.0 : 0.0, GridUnitType::Pixel});
                     Controls::ColumnDefinition iconColumn;
                     iconColumn.Width(GridLength{data->icon ? 14.0 : 0.0, GridUnitType::Pixel});
                     Controls::ColumnDefinition gapColumn;
                     gapColumn.Width(GridLength{data->icon ? 4.0 : 0.0, GridUnitType::Pixel});
                     Controls::ColumnDefinition textColumn;
-                    textColumn.Width(GridLength{1, GridUnitType::Star});
-                    labelHost.ColumnDefinitions().Append(expanderColumn);
+                    textColumn.Width(GridLength{1, GridUnitType::Auto});
+                    Controls::ColumnDefinition expanderColumn;
+                    expanderColumn.Width(GridLength{data->gpuSummary ? 12.0 : 0.0, GridUnitType::Pixel});
+                    Controls::ColumnDefinition trailingColumn;
+                    trailingColumn.Width(GridLength{1, GridUnitType::Star});
                     labelHost.ColumnDefinitions().Append(iconColumn);
                     labelHost.ColumnDefinitions().Append(gapColumn);
                     labelHost.ColumnDefinitions().Append(textColumn);
+                    labelHost.ColumnDefinitions().Append(expanderColumn);
+                    labelHost.ColumnDefinitions().Append(trailingColumn);
 
                     Controls::TextBlock expander;
                     expander.FontFamily(Media::FontFamily(L"Segoe UI Symbol"));
@@ -1837,7 +1840,7 @@ struct NativePanel {
                     expander.Text(data->gpuSummary
                         ? (expandedGpuGroups.find(data->gpuGroup) != expandedGpuGroups.end()
                             ? L"\u25BE" : L"\u25B8") : L"");
-                    Controls::Grid::SetColumn(expander, 0);
+                    Controls::Grid::SetColumn(expander, 3);
                     labelHost.Children().Append(expander);
 
                     Shapes::Path icon;
@@ -1847,10 +1850,11 @@ struct NativePanel {
                     icon.VerticalAlignment(VerticalAlignment::Center);
                     if (data->icon) icon.Data(BuildIconGeometry(*data->icon));
                     else icon.Visibility(Visibility::Collapsed);
-                    Controls::Grid::SetColumn(icon, 1);
+                    Controls::Grid::SetColumn(icon, 0);
                     labelHost.Children().Append(icon);
 
-                    Controls::Grid::SetColumn(cells[0], 3);
+                    cells[0].Margin(Thickness{0, 4, data->gpuSummary ? 2.0 : 0.0, 4});
+                    Controls::Grid::SetColumn(cells[0], 2);
                     labelHost.Children().Append(cells[0]);
                     Controls::Grid::SetRow(labelHost, static_cast<int>(rowIndex));
                     Controls::Grid::SetColumn(labelHost, static_cast<int>(group * 4));
