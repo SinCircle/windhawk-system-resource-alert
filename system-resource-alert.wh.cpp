@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.8.2
+// @version         0.8.3
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -1773,17 +1773,16 @@ struct NativePanel {
             overviewKeys.clear();
             overviewRowsPerGroup = rowsPerGroup;
             overviewGroupCount = groups;
-            constexpr double kOverviewGroupWidth = 720.0;
-            overviewTable.Width(groups * kOverviewGroupWidth + (groups - 1) * 16.0);
+            overviewTable.ClearValue(FrameworkElement::WidthProperty());
             for (size_t group = 0; group < groups; ++group) {
                 if (group) {
                     Controls::ColumnDefinition spacer;
                     spacer.Width(GridLength{16, GridUnitType::Pixel});
                     overviewTable.ColumnDefinitions().Append(spacer);
                 }
-                for (double width : {150.0, 300.0, 270.0}) {
+                for (double autoValue : {1.0, 1.0, 1.0}) {
                     Controls::ColumnDefinition definition;
-                    definition.Width(GridLength{width, GridUnitType::Pixel});
+                    definition.Width(GridLength{autoValue, GridUnitType::Auto});
                     overviewTable.ColumnDefinitions().Append(definition);
                 }
             }
