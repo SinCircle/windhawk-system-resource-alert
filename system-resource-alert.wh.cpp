@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.7.0
+// @version         0.8.0
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -32,6 +32,7 @@ just before the system tray (to the left of the overflow arrow):
 - Commit icon + commit-limit percentage
 - System-drive icon + free GB
 - Disk-activity icon + active-time percentage
+- Disk-write icon + compact throughput
 - GPU card icon + utilization percentage (per adapter)
 - VRAM icon + dedicated-memory percentage (per adapter)
 - CPU/GPU thermometer icon + degrees Celsius
@@ -52,7 +53,8 @@ This version inserts native XAML controls into SystemTrayFrameGrid, in their
 own auto-sized column before the tray. It creates no overlay window and uses
 no topmost positioning. Taskbar layout owns the position and allocated space.
 The entire column can collapse when no resource is alerting. Native text and
-vector paths provide antialiasing without a bitmap or colored background.
+Microsoft Fluent UI System Icons vector paths provide antialiasing without a
+bitmap or colored background.
 
 Click any alert to open a rounded native, light-dismiss
 flyout with three columns: parameter, current value, and rolling one-hour extremum.
@@ -63,9 +65,14 @@ Hover a current value for its status or a parameter for device/source details.
 All readable rows are shown at once, without scrolling or pagination. The card
 grows to its content and splits long tables into adjacent groups. On unusually
 small screens it scales down only as needed to remain inside the work area.
-Disk active time is a sustained warning metric. System-drive read/write rates
-are diagnostic rows in the overview with rolling one-hour maxima; throughput
-has no universal warning threshold because storage devices differ greatly.
+Rows with a resource icon show it before the parameter name. Each physical GPU
+has its own collapsible summary row (load, dedicated VRAM, and temperature);
+expanding one GPU never mixes its readings or state with another adapter.
+CPU and disk active-time warning durations accumulate across brief dips below
+their thresholds. System-drive write time above the configured rate also
+accumulates; by default, dips below 5 MiB/s of at most five seconds keep the
+episode alive and 180 accumulated seconds trigger a warning. Read throughput
+remains diagnostic because storage devices differ greatly.
 The table refreshes while open. Extrema cover available samples from the most
 recent hour (or the shorter time since startup) and remain in memory only; free
 disk space records its minimum while other metrics record their maximum. No
@@ -161,11 +168,21 @@ taskbar is supported in this version.
   $name: Commit warning percentage
 - commitCriticalPct: 95
   $name: Commit critical percentage
-- diskActivityWarningPct: 95
+- diskActivityWarningPct: 90
   $name: System-drive activity warning percentage
-- diskActivityWarningSeconds: 30
+- diskActivityWarningSeconds: 60
   $name: System-drive activity warning duration
-  $description: System-drive active time must stay above the threshold for this many seconds. Read/write throughput is diagnostic only and has no universal alert threshold.
+  $description: Accumulated above-threshold time needed for a warning. Brief dips use the High-usage gap setting.
+- highUsageGapSeconds: 5
+  $name: CPU / disk-activity gap tolerance
+  $description: A below-threshold gap up to this many seconds doesn't discard accumulated CPU or disk-activity time.
+- diskWriteWarningMiBps: 5
+  $name: System-drive write warning rate (MiB/s)
+- diskWriteWarningSeconds: 180
+  $name: System-drive write accumulated duration
+- diskWriteGapSeconds: 5
+  $name: System-drive write gap tolerance
+  $description: A write-rate dip below the threshold up to this many seconds doesn't discard accumulated write time.
 - diskWarningPct: 10
   $name: Disk warning percentage
 - diskCriticalPct: 5
@@ -235,6 +252,7 @@ taskbar is supported in this version.
 #include <chrono>
 #include <deque>
 #include <string_view>
+#include <set>
 #include <cstdio>
 #include <cstddef>
 #include <cwctype>
@@ -244,9 +262,9 @@ namespace {
 
 using namespace winrt::Windows::UI::Xaml;
 constexpr wchar_t kComponentName[] = L"WindhawkSystemResourceAlertComponent";
-constexpr size_t kResourceCount = 11;
+constexpr size_t kResourceCount = 12;
 constexpr size_t kMaxGpus = 8;
-constexpr size_t kMaxAlerts = 7 + 3 * kMaxGpus;
+constexpr size_t kMaxAlerts = 8 + 3 * kMaxGpus;
 constexpr size_t kMaxColumns = (kMaxAlerts + 1) / 2;
 
 enum class Severity : int {
@@ -267,6 +285,7 @@ enum class ResourceKind : size_t {
     CpuTemperature = 8,
     Overview = 9,
     DiskActivity = 10,
+    DiskWrite = 11,
 };
 
 struct Settings {
@@ -290,8 +309,12 @@ struct Settings {
     std::atomic<int> diskCriticalPct{5};
     std::atomic<int> diskWarningGB{10};
     std::atomic<int> diskCriticalGB{3};
-    std::atomic<int> diskActivityWarningPct{95};
-    std::atomic<int> diskActivityWarningSeconds{30};
+    std::atomic<int> diskActivityWarningPct{90};
+    std::atomic<int> diskActivityWarningSeconds{60};
+    std::atomic<int> highUsageGapSeconds{5};
+    std::atomic<int> diskWriteWarningMiBps{5};
+    std::atomic<int> diskWriteWarningSeconds{180};
+    std::atomic<int> diskWriteGapSeconds{5};
     std::atomic<int> cpuWarningPct{95};
     std::atomic<int> cpuWarningSeconds{30};
     std::atomic<int> warningSustainSeconds{5};
@@ -337,6 +360,8 @@ struct AlertTracker {
     int warningStreak = 0;
     int criticalStreak = 0;
     int recoveryStreak = 0;
+    int warningAccumulatedMs = 0;
+    int warningGapMs = 0;
 };
 
 struct AlertItem {
@@ -351,6 +376,9 @@ struct OverviewRow {
     Severity severity = Severity::Normal;
     bool available = true;
     bool minimum = false;
+    std::optional<ResourceKind> icon;
+    std::wstring gpuGroup;
+    bool gpuSummary = false;
 };
 struct RuntimeSnapshot {
     std::vector<AlertItem> alerts;
@@ -481,6 +509,14 @@ void LoadSettings() {
         ClampInt(Wh_GetIntSetting(L"diskActivityWarningPct"), 50, 100);
     g_settings.diskActivityWarningSeconds =
         ClampInt(Wh_GetIntSetting(L"diskActivityWarningSeconds"), 1, 600);
+    g_settings.highUsageGapSeconds =
+        ClampInt(Wh_GetIntSetting(L"highUsageGapSeconds"), 0, 60);
+    g_settings.diskWriteWarningMiBps =
+        ClampInt(Wh_GetIntSetting(L"diskWriteWarningMiBps"), 1, 102400);
+    g_settings.diskWriteWarningSeconds =
+        ClampInt(Wh_GetIntSetting(L"diskWriteWarningSeconds"), 1, 3600);
+    g_settings.diskWriteGapSeconds =
+        ClampInt(Wh_GetIntSetting(L"diskWriteGapSeconds"), 0, 300);
     g_settings.cpuWarningPct =
         ClampInt(Wh_GetIntSetting(L"cpuWarningPct"), 50, 100);
     g_settings.cpuWarningSeconds =
@@ -1113,6 +1149,13 @@ Severity DiskActivitySeverity(const ResourceSample& sample) {
         ? Severity::Warning : Severity::Normal;
 }
 
+Severity DiskWriteSeverity(const ResourceSample& sample) {
+    const double threshold = g_settings.diskWriteWarningMiBps.load() *
+        1024.0 * 1024.0;
+    return std::isfinite(sample.diskWriteBps) && sample.diskWriteBps >= threshold
+        ? Severity::Warning : Severity::Normal;
+}
+
 void UpdateTracker(AlertTracker* tracker,
                    Severity raw,
                    int warningSustainSeconds) {
@@ -1200,6 +1243,21 @@ std::wstring FormatRate(double bytesPerSecond) {
     return FormatNumber(bytesPerSecond / gib, L" GiB/s");
 }
 
+std::wstring FormatCompactRate(double bytesPerSecond) {
+    if (!std::isfinite(bytesPerSecond) || bytesPerSecond < 0) return L"--";
+    constexpr double kib = 1024.0;
+    constexpr double mib = kib * 1024.0;
+    constexpr double gib = mib * 1024.0;
+    if (bytesPerSecond < mib)
+        return FormatNumber(bytesPerSecond / kib, L"K/s", 0);
+    if (bytesPerSecond < gib) {
+        const double value = bytesPerSecond / mib;
+        return FormatNumber(value, L"M/s", value < 10 ? 1 : 0);
+    }
+    const double value = bytesPerSecond / gib;
+    return FormatNumber(value, L"G/s", value < 10 ? 1 : 0);
+}
+
 Severity ThresholdSeverity(double value, double warning, double critical) {
     if (!std::isfinite(value) || value < 0) return Severity::Normal;
     if (value >= critical) return Severity::Critical;
@@ -1219,6 +1277,46 @@ void UpdateKnownTracker(AlertTracker* tracker, double value, Severity raw, int s
         return; // Missing data cannot confirm recovery from an existing alert.
     }
     UpdateTracker(tracker, raw, seconds);
+}
+
+void UpdateAccumulatingWarning(AlertTracker* tracker, double value, Severity raw,
+                               int requiredSeconds, int allowedGapSeconds) {
+    if (!tracker) return;
+    if (!std::isfinite(value) || value < 0) {
+        tracker->warningStreak = tracker->criticalStreak = tracker->recoveryStreak = 0;
+        tracker->warningAccumulatedMs = tracker->warningGapMs = 0;
+        return; // Missing data cannot confirm recovery or bridge an episode.
+    }
+
+    const int sampleMs = std::max(500, g_settings.updateIntervalMs.load());
+    const int requiredMs = requiredSeconds * 1000;
+    const int allowedGapMs = allowedGapSeconds * 1000;
+    tracker->criticalStreak = 0;
+    if (raw == Severity::Warning) {
+        tracker->warningAccumulatedMs = std::min(
+            requiredMs, tracker->warningAccumulatedMs + sampleMs);
+        tracker->warningGapMs = 0;
+        tracker->recoveryStreak = 0;
+        if (tracker->warningAccumulatedMs >= requiredMs)
+            tracker->displayed = Severity::Warning;
+        return;
+    }
+
+    if (tracker->displayed != Severity::Normal) {
+        ++tracker->recoveryStreak;
+        if (tracker->recoveryStreak >=
+            RequiredSamples(g_settings.recoverySeconds.load())) {
+            *tracker = {};
+        }
+        return;
+    }
+
+    tracker->recoveryStreak = 0;
+    tracker->warningGapMs += sampleMs;
+    if (tracker->warningGapMs > allowedGapMs) {
+        tracker->warningAccumulatedMs = 0;
+        tracker->warningGapMs = 0;
+    }
 }
 
 std::vector<AlertItem> BuildAlertItems() {
@@ -1243,6 +1341,8 @@ std::vector<AlertItem> BuildAlertItems() {
     append(ResourceKind::DiskActivity, FormatPercent(g_lastSample.diskActivityPct),
         std::wstring(1, g_lastSample.diskLetter) + L": 活动率 / 读 " +
         FormatRate(g_lastSample.diskReadBps) + L" / 写 " + FormatRate(g_lastSample.diskWriteBps));
+    append(ResourceKind::DiskWrite, FormatCompactRate(g_lastSample.diskWriteBps),
+        std::wstring(1, g_lastSample.diskLetter) + L": 写入速度 · 累计写入告警");
     append(ResourceKind::CpuTemperature, FormatNumber(g_lastSample.cpuTemperature, L"\u00B0", 0));
     for (size_t i = 0; i < g_lastSample.gpus.size(); ++i) {
         const auto& gpu = g_lastSample.gpus[i];
@@ -1273,7 +1373,9 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
                          std::wstring formatted, const wchar_t* peakSuffix,
                          std::wstring threshold, Severity displayed, Severity raw,
                          bool minimum = false, int decimals = 1,
-                         bool adaptiveRate = false) {
+                         bool adaptiveRate = false,
+                         std::optional<ResourceKind> icon = std::nullopt,
+                         std::wstring gpuGroup = L"", bool gpuSummary = false) {
         const bool available = std::isfinite(numeric) && numeric >= 0;
         if (available) {
             auto [it, inserted] = g_extrema.try_emplace(key, RollingExtremum{minimum});
@@ -1293,47 +1395,55 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
             available ? std::move(formatted) : L"--",
             !extremeValue ? L"--" : adaptiveRate ? FormatRate(*extremeValue)
                 : FormatNumber(*extremeValue, peakSuffix, decimals),
-            std::move(threshold), std::move(state), displayed, available, minimum});
+            std::move(threshold), std::move(state), displayed, available, minimum,
+            icon, std::move(gpuGroup), gpuSummary});
     };
     const auto thresholds = [](int warning, int critical, const wchar_t* unit) {
         return std::to_wstring(warning) + unit + L" / " + std::to_wstring(critical) + unit;
     };
     const double cpu = sample.valid ? sample.cpuPct : -1;
     add(L"cpu", L"CPU 使用率", cpu, FormatPercent(cpu), L"%",
-        std::to_wstring(g_settings.cpuWarningPct.load()) + L"% · " + std::to_wstring(g_settings.cpuWarningSeconds.load()) + L"秒",
-        Tracker(ResourceKind::Cpu).displayed, CpuSeverity(sample), false, 0);
+        L"≥" + std::to_wstring(g_settings.cpuWarningPct.load()) + L"% · 累计" +
+            std::to_wstring(g_settings.cpuWarningSeconds.load()) + L"秒 · 间断≤" +
+            std::to_wstring(g_settings.highUsageGapSeconds.load()) + L"秒",
+        Tracker(ResourceKind::Cpu).displayed, CpuSeverity(sample), false, 0, false, ResourceKind::Cpu);
     add(L"cpu-temp", L"CPU 最高温度", sample.cpuTemperature,
         FormatNumber(sample.cpuTemperature, L" °C"), L" °C",
         thresholds(g_settings.cpuTemperatureWarning, g_settings.cpuTemperatureCritical, L"°C"),
         Tracker(ResourceKind::CpuTemperature).displayed,
-        ThresholdSeverity(sample.cpuTemperature, g_settings.cpuTemperatureWarning, g_settings.cpuTemperatureCritical));
+        ThresholdSeverity(sample.cpuTemperature, g_settings.cpuTemperatureWarning, g_settings.cpuTemperatureCritical),
+        false, 1, false, ResourceKind::CpuTemperature);
     const double ram = sample.valid ? sample.ramUsedPct : -1;
     add(L"ram", L"物理内存", ram, FormatPercent(ram) + L" · " +
         FormatNumber(sample.physicalTotalGB - sample.physicalAvailableMB / 1024, L"") + L" / " +
         FormatNumber(sample.physicalTotalGB, L" GiB"), L"%", L"可用<10%且<4GiB\n严重<1%且<500MiB",
-        Tracker(ResourceKind::Memory).displayed, MemorySeverity(sample), false, 0);
+        Tracker(ResourceKind::Memory).displayed, MemorySeverity(sample), false, 0, false, ResourceKind::Memory);
     add(L"commit", L"提交内存", sample.valid ? sample.commitPct : -1,
         FormatPercent(sample.commitPct) + L" · " + FormatNumber(sample.commitUsedGB, L"") + L" / " +
         FormatNumber(sample.commitLimitGB, L" GiB"), L"%",
         thresholds(g_settings.commitWarningPct, g_settings.commitCriticalPct, L"%"),
-        Tracker(ResourceKind::Commit).displayed, CommitSeverity(sample), false, 0);
+        Tracker(ResourceKind::Commit).displayed, CommitSeverity(sample), false, 0, false, ResourceKind::Commit);
     add(L"disk", std::wstring(1, sample.diskLetter) + L": 可用空间", sample.valid ? sample.diskFreeGB : -1,
         FormatNumber(sample.diskFreeGB, L"") + L" / " + FormatNumber(sample.diskTotalGB, L" GiB"), L" GiB",
         L"<" + std::to_wstring(g_settings.diskWarningPct.load()) + L"%且<" + std::to_wstring(g_settings.diskWarningGB.load()) +
         L"GiB\n严重<" + std::to_wstring(g_settings.diskCriticalPct.load()) + L"%且<" + std::to_wstring(g_settings.diskCriticalGB.load()) + L"GiB",
-        Tracker(ResourceKind::Disk).displayed, DiskSeverity(sample), true);
+        Tracker(ResourceKind::Disk).displayed, DiskSeverity(sample), true, 1, false, ResourceKind::Disk);
     const std::wstring diskPrefix = std::wstring(1, sample.diskLetter) + L": ";
     add(L"disk-activity", diskPrefix + L"活动率", sample.diskActivityPct,
         FormatPercent(sample.diskActivityPct), L"%",
-        std::to_wstring(g_settings.diskActivityWarningPct.load()) + L"% · " +
-            std::to_wstring(g_settings.diskActivityWarningSeconds.load()) + L"秒",
-        Tracker(ResourceKind::DiskActivity).displayed, DiskActivitySeverity(sample), false, 0);
+        L"≥" + std::to_wstring(g_settings.diskActivityWarningPct.load()) + L"% · 累计" +
+            std::to_wstring(g_settings.diskActivityWarningSeconds.load()) + L"秒 · 间断≤" +
+            std::to_wstring(g_settings.highUsageGapSeconds.load()) + L"秒",
+        Tracker(ResourceKind::DiskActivity).displayed, DiskActivitySeverity(sample), false, 0, false, ResourceKind::DiskActivity);
     add(L"disk-read", diskPrefix + L"读取速度", sample.diskReadBps,
         FormatRate(sample.diskReadBps), L"", L"诊断指标，无通用阈值",
         Severity::Normal, Severity::Normal, false, 1, true);
     add(L"disk-write", diskPrefix + L"写入速度", sample.diskWriteBps,
-        FormatRate(sample.diskWriteBps), L"", L"诊断指标，无通用阈值",
-        Severity::Normal, Severity::Normal, false, 1, true);
+        FormatRate(sample.diskWriteBps), L"",
+        L"≥" + std::to_wstring(g_settings.diskWriteWarningMiBps.load()) +
+            L" MiB/s · 累计" + std::to_wstring(g_settings.diskWriteWarningSeconds.load()) +
+            L"秒 · 间断≤" + std::to_wstring(g_settings.diskWriteGapSeconds.load()) + L"秒",
+        Tracker(ResourceKind::DiskWrite).displayed, DiskWriteSeverity(sample), false, 1, true, ResourceKind::DiskWrite);
     add(L"processes", L"进程数", sample.valid ? sample.processCount : -1.0, std::to_wstring(sample.processCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
     add(L"threads", L"线程数", sample.valid ? sample.threadCount : -1.0, std::to_wstring(sample.threadCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
     add(L"handles", L"句柄数", sample.valid ? sample.handleCount : -1.0, std::to_wstring(sample.handleCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
@@ -1344,18 +1454,68 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
         snapshot.devices += prefix + gpu.name + (gpu.nvml ? L" [NVML + Windows]\n" : L" [Windows]\n");
         add(gpu.id + L"load", prefix + L"使用率", gpu.load, FormatPercent(gpu.load), L"%",
             std::to_wstring(g_settings.gpuWarningPct.load()) + L"% · " + std::to_wstring(g_settings.gpuWarningSeconds.load()) + L"秒",
-            trackers[0].displayed, ThresholdSeverity(gpu.load, g_settings.gpuWarningPct, 101), false, 0);
+            trackers[0].displayed, ThresholdSeverity(gpu.load, g_settings.gpuWarningPct, 101),
+            false, 0, false, ResourceKind::Gpu, gpu.id);
         add(gpu.id + L"vram", prefix + L"专用显存", gpu.VramPct(),
             FormatPercent(gpu.VramPct()) + L" · " + FormatNumber(gpu.dedicatedUsedGB, L"") + L" / " + FormatNumber(gpu.dedicatedTotalGB, L" GiB"), L"%",
             gpu.dedicatedTotalGB < 1 ? L"小容量 UMA 不告警" : thresholds(g_settings.vramWarningPct, g_settings.vramCriticalPct, L"%"),
-            trackers[1].displayed, VramSeverity(gpu), false, 0);
+            trackers[1].displayed, VramSeverity(gpu),
+            false, 0, false, ResourceKind::Vram, gpu.id);
         add(gpu.id + L"shared", prefix + L"共享显存", gpu.sharedUsedGB, FormatNumber(gpu.sharedUsedGB, L" GiB"), L" GiB",
-            L"参照系统内存告警", Severity::Normal, Severity::Normal);
+            L"参照系统内存告警", Severity::Normal, Severity::Normal,
+            false, 1, false, ResourceKind::Vram, gpu.id);
         add(gpu.id + L"temp", prefix + L"核心温度", gpu.temperature, FormatNumber(gpu.temperature, L" °C"), L" °C",
             thresholds(g_settings.gpuTemperatureWarning, g_settings.gpuTemperatureCritical, L"°C"),
-            trackers[2].displayed, ThresholdSeverity(gpu.temperature, g_settings.gpuTemperatureWarning, g_settings.gpuTemperatureCritical));
+            trackers[2].displayed, ThresholdSeverity(gpu.temperature, g_settings.gpuTemperatureWarning, g_settings.gpuTemperatureCritical),
+            false, 1, false, ResourceKind::GpuTemperature, gpu.id);
         add(gpu.id + L"power", prefix + L"功耗", gpu.powerW, FormatNumber(gpu.powerW, L" W"), L" W", L"—", Severity::Normal, Severity::Normal);
-        add(gpu.id + L"clock", prefix + L"核心频率", gpu.clockMHz, FormatNumber(gpu.clockMHz, L" MHz", 0), L" MHz", L"—", Severity::Normal, Severity::Normal, false, 0);
+        snapshot.overview.back().icon = ResourceKind::Gpu;
+        snapshot.overview.back().gpuGroup = gpu.id;
+        add(gpu.id + L"clock", prefix + L"核心频率", gpu.clockMHz, FormatNumber(gpu.clockMHz, L" MHz", 0), L" MHz", L"—",
+            Severity::Normal, Severity::Normal, false, 0, false, ResourceKind::Gpu, gpu.id);
+
+        const auto join = [](const std::vector<std::wstring>& parts) {
+            std::wstring result;
+            for (const auto& part : parts) {
+                if (!result.empty()) result += L" · ";
+                result += part;
+            }
+            return result.empty() ? std::wstring(L"--") : result;
+        };
+        const auto rowPeak = [&](const std::wstring& key) {
+            const auto found = std::find_if(snapshot.overview.begin(), snapshot.overview.end(),
+                [&](const auto& row) { return row.key == key; });
+            return found == snapshot.overview.end() ? std::wstring(L"--") : found->peak;
+        };
+        std::vector<std::wstring> currentParts, peakParts;
+        if (gpu.load >= 0) {
+            currentParts.push_back(L"负载 " + FormatPercent(gpu.load));
+            peakParts.push_back(L"负载 " + rowPeak(gpu.id + L"load"));
+        }
+        if (gpu.VramPct() >= 0) {
+            currentParts.push_back(L"显存 " + FormatPercent(gpu.VramPct()));
+            peakParts.push_back(L"显存 " + rowPeak(gpu.id + L"vram"));
+        }
+        if (gpu.temperature >= 0) {
+            currentParts.push_back(L"温度 " + FormatNumber(gpu.temperature, L" °C", 0));
+            peakParts.push_back(L"温度 " + rowPeak(gpu.id + L"temp"));
+        }
+        const Severity summaryDisplayed = std::max({trackers[0].displayed,
+            trackers[1].displayed, trackers[2].displayed});
+        const Severity summaryRaw = std::max({
+            ThresholdSeverity(gpu.load, g_settings.gpuWarningPct, 101),
+            VramSeverity(gpu),
+            ThresholdSeverity(gpu.temperature, g_settings.gpuTemperatureWarning,
+                              g_settings.gpuTemperatureCritical)});
+        const bool summaryAvailable = !currentParts.empty();
+        const std::wstring summaryState = !summaryAvailable ? L"不可用" :
+            summaryDisplayed == Severity::Critical ? L"严重" :
+            summaryDisplayed == Severity::Warning ? L"告警" :
+            summaryRaw != Severity::Normal ? L"确认中" : L"正常";
+        snapshot.overview.push_back({gpu.id + L"summary", L"GPU " + std::to_wstring(i),
+            join(currentParts), join(peakParts), L"点击展开或折叠 · " + gpu.name,
+            summaryState, summaryDisplayed, summaryAvailable, false,
+            ResourceKind::Gpu, gpu.id, true});
     }
     if (sample.cpuTemperature >= 0)
         snapshot.devices += L"CPU 温度来源：LibreHardwareMonitor（" +
@@ -1371,8 +1531,37 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
         if (row.state == L"确认中") return 2;
         return row.available ? 3 : 4;
     };
-    std::stable_sort(snapshot.overview.begin(), snapshot.overview.end(),
-        [&](const auto& left, const auto& right) { return priority(left) < priority(right); });
+    struct OverviewBlock {
+        std::wstring gpuGroup;
+        std::vector<OverviewRow> rows;
+        int priority = 4;
+    };
+    std::vector<OverviewBlock> blocks;
+    std::map<std::wstring, size_t> gpuBlocks;
+    for (auto& row : snapshot.overview) {
+        if (row.gpuGroup.empty()) {
+            blocks.push_back({L"", {}, priority(row)});
+            blocks.back().rows.push_back(std::move(row));
+            continue;
+        }
+        auto [found, inserted] = gpuBlocks.try_emplace(row.gpuGroup, blocks.size());
+        if (inserted) blocks.push_back({row.gpuGroup, {}, priority(row)});
+        auto& block = blocks[found->second];
+        block.priority = std::min(block.priority, priority(row));
+        block.rows.push_back(std::move(row));
+    }
+    for (auto& block : blocks) {
+        if (block.gpuGroup.empty()) continue;
+        std::stable_sort(block.rows.begin(), block.rows.end(), [&](const auto& left, const auto& right) {
+            if (left.gpuSummary != right.gpuSummary) return left.gpuSummary;
+            return priority(left) < priority(right);
+        });
+    }
+    std::stable_sort(blocks.begin(), blocks.end(),
+        [](const auto& left, const auto& right) { return left.priority < right.priority; });
+    snapshot.overview.clear();
+    for (auto& block : blocks)
+        for (auto& row : block.rows) snapshot.overview.push_back(std::move(row));
     return snapshot;
 }
 
@@ -1410,96 +1599,59 @@ constexpr size_t AlertRowsPerColumn(size_t count) {
     return count == 3 ? 3 : 2;
 }
 
+// Microsoft Fluent UI System Icons, 16 px regular variants (MIT).
+// Keeping the original path data gives the taskbar and overview the same
+// carefully hinted geometry at native small sizes.
 Media::PathGeometry BuildIconGeometry(ResourceKind kind) {
-    Media::PathGeometry geometry;
-    using Point = winrt::Windows::Foundation::Point;
-    const auto add = [&](std::initializer_list<Point> points, bool closed = false) {
-        Media::PathFigure figure;
-        figure.StartPoint(*points.begin());
-        figure.IsClosed(closed);
-        // Keep figures in the geometry bounds calculation. On the taskbar's
-        // XAML runtime, hollow figures produce empty Bounds and collapse the
-        // stroked Path to a dot. The Path's null Fill still prevents any fill.
-        figure.IsFilled(true);
-        Media::PolyLineSegment lines;
-        auto point = points.begin();
-        for (++point; point != points.end(); ++point) lines.Points().Append(*point);
-        figure.Segments().Append(lines);
-        geometry.Figures().Append(figure);
-    };
+    const wchar_t* data = nullptr;
     switch (kind) {
         case ResourceKind::Cpu:
-            add({{4,4},{12,4},{12,12},{4,12}}, true);
-            add({{6,6},{10,6},{10,10},{6,10}}, true);
-            for (float p : {6.f, 10.f}) {
-                add({{p,1},{p,4}}); add({{p,12},{p,15}});
-                add({{1,p},{4,p}}); add({{12,p},{15,p}});
-            }
+            data = LR"PATH(M14.5 8.5C14.633 8.5 14.76 8.447 14.854 8.354C14.948 8.26 15 8.133 15 8C15 7.867 14.947 7.74 14.854 7.646C14.76 7.552 14.633 7.5 14.5 7.5H13V6H14.5C14.633 6 14.76 5.947 14.854 5.854C14.948 5.76 15 5.633 15 5.5C15 5.367 14.947 5.24 14.854 5.146C14.76 5.052 14.633 5 14.5 5H13C13 4.47 12.789 3.961 12.414 3.586C12.039 3.211 11.53 3 11 3V1.5C11 1.367 10.947 1.24 10.854 1.146C10.76 1.052 10.633 1 10.5 1C10.367 1 10.24 1.053 10.146 1.146C10.052 1.24 10 1.367 10 1.5V3H8.5V1.5C8.5 1.367 8.447 1.24 8.354 1.146C8.26 1.052 8.133 1 8 1C7.867 1 7.74 1.053 7.646 1.146C7.552 1.24 7.5 1.367 7.5 1.5V3H6V1.5C6 1.367 5.947 1.24 5.854 1.146C5.76 1.052 5.633 1 5.5 1C5.367 1 5.24 1.053 5.146 1.146C5.052 1.24 5 1.367 5 1.5V3C4.47 3 3.961 3.211 3.586 3.586C3.211 3.961 3 4.47 3 5H1.5C1.367 5 1.24 5.053 1.146 5.146C1.052 5.24 1 5.367 1 5.5C1 5.633 1.053 5.76 1.146 5.854C1.24 5.948 1.367 6 1.5 6H3V7.5H1.5C1.367 7.5 1.24 7.553 1.146 7.646C1.052 7.74 1 7.867 1 8C1 8.133 1.053 8.26 1.146 8.354C1.24 8.448 1.367 8.5 1.5 8.5H3V10H1.5C1.367 10 1.24 10.053 1.146 10.146C1.052 10.24 1 10.367 1 10.5C1 10.633 1.053 10.76 1.146 10.854C1.24 10.948 1.367 11 1.5 11H3C3 11.53 3.211 12.039 3.586 12.414C3.961 12.789 4.47 13 5 13V14.5C5 14.633 5.053 14.76 5.146 14.854C5.24 14.948 5.367 15 5.5 15C5.633 15 5.76 14.947 5.854 14.854C5.948 14.76 6 14.633 6 14.5V13H7.5V14.5C7.5 14.633 7.553 14.76 7.646 14.854C7.74 14.948 7.867 15 8 15C8.133 15 8.26 14.947 8.354 14.854C8.448 14.76 8.5 14.633 8.5 14.5V13H10V14.5C10 14.633 10.053 14.76 10.146 14.854C10.24 14.948 10.367 15 10.5 15C10.633 15 10.76 14.947 10.854 14.854C10.948 14.76 11 14.633 11 14.5V13C11.53 13 12.039 12.789 12.414 12.414C12.789 12.039 13 11.53 13 11H14.5C14.633 11 14.76 10.947 14.854 10.854C14.948 10.76 15 10.633 15 10.5C15 10.367 14.947 10.24 14.854 10.146C14.76 10.052 14.633 10 14.5 10H13V8.5H14.5ZM12 11C12 11.265 11.895 11.52 11.707 11.707C11.519 11.894 11.265 12 11 12H5C4.735 12 4.48 11.895 4.293 11.707C4.105 11.519 4 11.265 4 11V5C4 4.735 4.105 4.48 4.293 4.293C4.481 4.105 4.735 4 5 4H11C11.265 4 11.52 4.105 11.707 4.293C11.895 4.481 12 4.735 12 5V11ZM8 10.5C6.621 10.5 5.5 9.379 5.5 8C5.5 6.621 6.621 5.5 8 5.5C9.379 5.5 10.5 6.621 10.5 8C10.5 9.379 9.379 10.5 8 10.5ZM8 6.5C7.173 6.5 6.5 7.173 6.5 8C6.5 8.827 7.173 9.5 8 9.5C8.827 9.5 9.5 8.827 9.5 8C9.5 7.173 8.827 6.5 8 6.5Z)PATH";
             break;
         case ResourceKind::Memory:
-            add({{1,4},{15,4},{15,12},{1,12}}, true);
-            for (float x : {3.f, 7.f, 11.f})
-                add({{x,6},{x+2,6},{x+2,10},{x,10}}, true);
-            add({{3,12},{3,15}}); add({{6,12},{6,14}});
-            add({{10,12},{10,14}}); add({{13,12},{13,15}});
+            data = LR"PATH(M3.5 5H12.5C12.776 5 13 5.224 13 5.5V8.5C13 8.776 12.776 9 12.5 9H3.5C3.224 9 3 8.776 3 8.5V5.5C3 5.224 3.224 5 3.5 5ZM9 8V6H7V8H9ZM6 6H4V8H6V6ZM10 8H12V6H10V8ZM3 3H13C14.103 3 15 3.897 15 5V9C15 9.739 14.597 10.385 14 10.731V11.75C14 12.439 13.439 13 12.75 13H9.5C9.367 13 9.24 12.948 9.146 12.854L8 11.708L6.854 12.854C6.76 12.947 6.633 13 6.5 13H3.25C2.561 13 2 12.439 2 11.75V10.731C1.403 10.385 1 9.739 1 9V5C1 3.897 1.897 3 3 3ZM3.25 12H6.293L7.293 11H3V11.75C3 11.888 3.112 12 3.25 12ZM12.75 12C12.888 12 13 11.888 13 11.75V11H8.707L9.707 12H12.75ZM13 10C13.552 10 14 9.551 14 9V5C14 4.449 13.552 4 13 4H3C2.448 4 2 4.449 2 5V9C2 9.551 2.448 10 3 10H13Z)PATH";
             break;
         case ResourceKind::Commit:
-            add({{5,1},{14,1},{14,11},{5,11}}, true);
-            add({{2,4},{11,4},{11,15},{2,15}}, true);
-            add({{4,8},{9,8}}); add({{4,11},{9,11}});
+            data = LR"PATH(M6 1C4.89543 1 4 1.89543 4 3V5.20703C4.32228 5.11588 4.65659 5.05337 5 5.02242V3C5 2.44772 5.44772 2 6 2H9V4.5C9 5.32843 9.67157 6 10.5 6H13V13C13 13.5523 12.5523 14 12 14H9.74284C9.42948 14.3794 9.06621 14.7161 8.66308 15H12C13.1046 15 14 14.1046 14 13V5.41421C14 5.01639 13.842 4.63486 13.5607 4.35355L10.6464 1.43934C10.3651 1.15804 9.98361 1 9.58579 1H6ZM12.7929 5H10.5C10.2239 5 10 4.77614 10 4.5V2.20711L12.7929 5ZM10 10.5C10 12.9853 7.98528 15 5.5 15C3.01472 15 1 12.9853 1 10.5C1 8.01472 3.01472 6 5.5 6C7.98528 6 10 8.01472 10 10.5ZM6 8.5C6 8.22386 5.77614 8 5.5 8C5.22386 8 5 8.22386 5 8.5V10H3.5C3.22386 10 3 10.2239 3 10.5C3 10.7761 3.22386 11 3.5 11H5L5 12.5C5 12.7761 5.22386 13 5.5 13C5.77614 13 6 12.7761 6 12.5V11H7.5C7.77614 11 8 10.7761 8 10.5C8 10.2239 7.77614 10 7.5 10H6V8.5Z)PATH";
             break;
         case ResourceKind::Disk:
-            add({{2,4},{3,2},{6,1},{10,1},{13,2},{14,4},{13,6},{10,7},{6,7},{3,6},{2,4}});
-            add({{2,4},{2,12},{3,14},{6,15},{10,15},{13,14},{14,12},{14,4}});
-            add({{2,9},{3,11},{6,12},{10,12},{13,11},{14,9}});
-            break;
-        case ResourceKind::DiskActivity:
-            add({{1,2},{15,2},{15,14},{1,14}}, true);
-            add({{8,4},{10,5},{11,7},{10,9},{8,10},{6,9},{5,7},{6,5},{8,4}}, true);
-            add({{1,11},{15,11}}); add({{12,12.5f},{13,12.5f}});
+            data = LR"PATH(M13.854 7.85407L11.885 3.72707V3.72007C11.7857 3.50319 11.6256 3.31976 11.4241 3.19198C11.2227 3.06419 10.9885 2.99753 10.75 3.00007H5.25C5.01163 2.99773 4.77769 3.06448 4.57645 3.19225C4.37521 3.32002 4.21528 3.50335 4.116 3.72007V3.72707L2.146 7.85407C2.04981 8.05584 1.99993 8.27655 2 8.50007V10.5001C2 10.8979 2.15804 11.2794 2.43934 11.5607C2.72064 11.842 3.10218 12.0001 3.5 12.0001H12.5C12.8978 12.0001 13.2794 11.842 13.5607 11.5607C13.842 11.2794 14 10.8979 14 10.5001V8.50007C14.0001 8.27655 13.9502 8.05584 13.854 7.85407V7.85407ZM5.25 4.00007H10.75C10.7973 3.99854 10.8439 4.01101 10.8842 4.03592C10.9244 4.06083 10.9563 4.09706 10.976 4.14007V4.14007L12.339 7.00007H3.661L5.023 4.14307C5.0423 4.09934 5.07421 4.06237 5.11465 4.03689C5.1551 4.01141 5.20222 3.99859 5.25 4.00007V4.00007ZM13 10.5001C13 10.6327 12.9473 10.7599 12.8536 10.8536C12.7598 10.9474 12.6326 11.0001 12.5 11.0001H3.5C3.36739 11.0001 3.24022 10.9474 3.14645 10.8536C3.05268 10.7599 3 10.6327 3 10.5001V8.50007C3 8.36746 3.05268 8.24028 3.14645 8.14652C3.24022 8.05275 3.36739 8.00007 3.5 8.00007H12.5C12.5943 8.00006 12.6867 8.02672 12.7665 8.07697C12.8463 8.12722 12.9103 8.19902 12.951 8.28407C12.983 8.3516 12.9997 8.42535 13 8.50007V10.5001ZM12 9.50007C12 9.59896 11.9707 9.69563 11.9157 9.77785C11.8608 9.86008 11.7827 9.92417 11.6913 9.96201C11.6 9.99985 11.4994 10.0098 11.4025 9.99046C11.3055 9.97117 11.2164 9.92355 11.1464 9.85362C11.0765 9.7837 11.0289 9.69461 11.0096 9.59762C10.9903 9.50062 11.0002 9.40009 11.0381 9.30873C11.0759 9.21737 11.14 9.13928 11.2222 9.08433C11.3044 9.02939 11.4011 9.00007 11.5 9.00007C11.6326 9.00007 11.7598 9.05275 11.8536 9.14652C11.9473 9.24028 12 9.36746 12 9.50007Z)PATH";
             break;
         case ResourceKind::Monitor:
-            add({{8,1},{15,14},{1,14}}, true);
-            add({{8,5},{8,9}}); add({{8,11},{8,12}});
+            data = LR"PATH(M8 1C11.866 1 15 4.13401 15 8C15 11.866 11.866 15 8 15C4.13401 15 1 11.866 1 8C1 4.13401 4.13401 1 8 1ZM8 2C4.68629 2 2 4.68629 2 8C2 11.3137 4.68629 14 8 14C11.3137 14 14 11.3137 14 8C14 4.68629 11.3137 2 8 2ZM8 10C8.41421 10 8.75 10.3358 8.75 10.75C8.75 11.1642 8.41421 11.5 8 11.5C7.58579 11.5 7.25 11.1642 7.25 10.75C7.25 10.3358 7.58579 10 8 10ZM8 4.5C8.24546 4.5 8.44985 4.67691 8.49219 4.91016L8.5 5V8.5C8.5 8.77614 8.27614 9 8 9C7.75454 9 7.55015 8.82309 7.50781 8.58984L7.5 8.5V5C7.5 4.72386 7.72386 4.5 8 4.5Z)PATH";
             break;
         case ResourceKind::Gpu:
-            add({{1,3},{15,3},{15,12},{1,12}}, true);
-            add({{1,1},{1,14}}); add({{4,12},{4,15},{11,15},{11,12}});
-            add({{9,5},{11,6},{12,8},{11,10},{9,11},{7,10},{6,8},{7,6},{9,5}}, true);
-            add({{9,5},{9,11}}); add({{6,8},{12,8}});
-            add({{3,5},{4,5}}); add({{3,8},{4,8}}); add({{13,5},{14,5}});
+            data = LR"PATH(M4 2C2.89543 2 2 2.89543 2 4V9.99729C2 11.1019 2.89543 11.9973 4 11.9973H6.005V13.008L4.50598 13.008C4.22984 13.008 4.00598 13.2319 4.00599 13.508C4.00599 13.7841 4.22985 14.008 4.50599 14.008L11.5021 14.0079C11.7783 14.0079 12.0021 13.7841 12.0021 13.5079C12.0021 13.2318 11.7783 13.0079 11.5021 13.0079L10.0029 13.0079V11.9973H12C13.1046 11.9973 14 11.1019 14 9.99729V4C14 2.89543 13.1046 2 12 2H4ZM9.00293 11.9973V13.008L7.005 13.008V11.9973H9.00293ZM3 4C3 3.44772 3.44772 3 4 3H12C12.5523 3 13 3.44772 13 4V9.99729C13 10.5496 12.5523 10.9973 12 10.9973H4C3.44772 10.9973 3 10.5496 3 9.99729V4Z)PATH";
             break;
         case ResourceKind::Vram:
-            add({{3,3},{13,3},{13,13},{3,13}}, true);
-            add({{5,5},{8,5},{8,11},{5,11}}, true);
-            add({{9,5},{11,5},{11,11},{9,11}}, true);
-            for (float p : {5.f, 8.f, 11.f}) {
-                add({{p,1},{p,3}}); add({{p,13},{p,15}});
-                add({{1,p},{3,p}}); add({{13,p},{15,p}});
-            }
+            data = LR"PATH(M14.414 4.586C14.039 4.2109 13.5304 4.00011 13 4V2.5C13 2.36739 12.9473 2.24021 12.8536 2.14645C12.7598 2.05268 12.6326 2 12.5 2C12.3674 2 12.2402 2.05268 12.1464 2.14645C12.0527 2.24021 12 2.36739 12 2.5V4H10V2.5C10 2.36739 9.94732 2.24021 9.85355 2.14645C9.75979 2.05268 9.63261 2 9.5 2C9.36739 2 9.24021 2.05268 9.14645 2.14645C9.05268 2.24021 9 2.36739 9 2.5V4H7V2.5C7 2.36739 6.94732 2.24021 6.85355 2.14645C6.75979 2.05268 6.63261 2 6.5 2C6.36739 2 6.24021 2.05268 6.14645 2.14645C6.05268 2.24021 6 2.36739 6 2.5V4H4V2.5C4 2.36739 3.94732 2.24021 3.85355 2.14645C3.75979 2.05268 3.63261 2 3.5 2C3.36739 2 3.24021 2.05268 3.14645 2.14645C3.05268 2.24021 3 2.36739 3 2.5V4C2.46957 4 1.96086 4.21071 1.58579 4.58579C1.21071 4.96086 1 5.46957 1 6V10C1 10.5304 1.21071 11.0391 1.58579 11.4142C1.96086 11.7893 2.46957 12 3 12V13.5C3 13.6326 3.05268 13.7598 3.14645 13.8536C3.24021 13.9473 3.36739 14 3.5 14C3.63261 14 3.75979 13.9473 3.85355 13.8536C3.94732 13.7598 4 13.6326 4 13.5V12H6V13.5C6 13.6326 6.05268 13.7598 6.14645 13.8536C6.24021 13.9473 6.36739 14 6.5 14C6.63261 14 6.75979 13.9473 6.85355 13.8536C6.94732 13.7598 7 13.6326 7 13.5V12H9V13.5C9 13.6326 9.05268 13.7598 9.14645 13.8536C9.24021 13.9473 9.36739 14 9.5 14C9.63261 14 9.75979 13.9473 9.85355 13.8536C9.94732 13.7598 10 13.6326 10 13.5V12H12V13.5C12 13.6326 12.0527 13.7598 12.1464 13.8536C12.2402 13.9473 12.3674 14 12.5 14C12.6326 14 12.7598 13.9473 12.8536 13.8536C12.9473 13.7598 13 13.6326 13 13.5V12C13.5304 12 14.0391 11.7893 14.4142 11.4142C14.7893 11.0391 15 10.5304 15 10V6C14.9999 5.46961 14.7891 4.96099 14.414 4.586ZM14 10C14 10.2652 13.8946 10.5196 13.7071 10.7071C13.5196 10.8946 13.2652 11 13 11H3C2.73478 11 2.48043 10.8946 2.29289 10.7071C2.10536 10.5196 2 10.2652 2 10V6C2 5.73478 2.10536 5.48043 2.29289 5.29289C2.48043 5.10536 2.73478 5 3 5H13C13.2652 5 13.5196 5.10536 13.7071 5.29289C13.8946 5.48043 14 5.73478 14 6V10ZM12.5 6H3.5C3.36739 6 3.24021 6.05268 3.14645 6.14645C3.05268 6.24021 3 6.36739 3 6.5V9.5C3 9.63261 3.05268 9.75979 3.14645 9.85355C3.24021 9.94732 3.36739 10 3.5 10H12.5C12.6326 10 12.7598 9.94732 12.8536 9.85355C12.9473 9.75979 13 9.63261 13 9.5V6.5C13 6.36739 12.9473 6.24021 12.8536 6.14645C12.7598 6.05268 12.6326 6 12.5 6ZM12 9H4V7H12V9Z)PATH";
+            break;
+        case ResourceKind::GpuTemperature:
+            data = LR"PATH(M5.00015 3.5C5.00015 2.11943 6.11887 1 7.49972 1C8.88042 1 9.9997 2.11927 9.99972 3.49997V3.49997L10.0001 8.95055C10.6181 9.58133 11 10.4463 11 11.4C11 13.333 9.433 14.9 7.5 14.9C5.567 14.9 4 13.333 4 11.4C4 10.4462 4.38202 9.58114 5.00015 8.95034V3.5ZM7.49972 2C6.67143 2 6.00015 2.67143 6.00015 3.5V9.38726L5.83358 9.53632C5.32125 9.99481 5 10.6595 5 11.4C5 12.7807 6.11929 13.9 7.5 13.9C8.88071 13.9 10 12.7807 10 11.4C10 10.6596 9.67882 9.99497 9.1666 9.53649L9.00008 9.38744L8.99972 3.50003C8.99972 2.6716 8.32815 2 7.49972 2ZM8.0002 5.9999C8.0002 5.72376 7.77634 5.4999 7.5002 5.4999C7.22405 5.4999 7.0002 5.72376 7.0002 5.9999V10.0851C6.4174 10.2909 5.9998 10.8466 5.9998 11.4999C5.9998 12.3283 6.67138 12.9999 7.4998 12.9999C8.32823 12.9999 8.9998 12.3283 8.9998 11.4999C8.9998 10.8469 8.58259 10.2914 8.0002 10.0854V5.9999Z)PATH";
             break;
         case ResourceKind::CpuTemperature:
-        case ResourceKind::GpuTemperature:
-            add({{10,1},{13,1},{13,9},{15,11},{15,13},{13,15},{10,15},{8,13},{8,11},{10,9}}, true);
-            add({{11.5f,4},{11.5f,12}});
-            if (kind == ResourceKind::CpuTemperature) {
-                add({{1,4},{6,4},{6,9},{1,9}}, true);
-                add({{2,2},{2,4}}); add({{5,2},{5,4}});
-                add({{2,9},{2,11}}); add({{5,9},{5,11}});
-            } else {
-                add({{1,3},{6,3},{6,10},{1,10}}, true);
-                add({{1,1},{1,12}}); add({{2,6},{5,6}});
-                add({{3,10},{3,12}}); add({{5,10},{5,12}});
-            }
+            data = LR"PATH(M5.00015 3.5C5.00015 2.11943 6.11887 1 7.49972 1C8.88042 1 9.9997 2.11927 9.99972 3.49997V3.49997L10.0001 8.95055C10.6181 9.58133 11 10.4463 11 11.4C11 13.333 9.433 14.9 7.5 14.9C5.567 14.9 4 13.333 4 11.4C4 10.4462 4.38202 9.58114 5.00015 8.95034V3.5ZM7.49972 2C6.67143 2 6.00015 2.67143 6.00015 3.5V9.38726L5.83358 9.53632C5.32125 9.99481 5 10.6595 5 11.4C5 12.7807 6.11929 13.9 7.5 13.9C8.88071 13.9 10 12.7807 10 11.4C10 10.6596 9.67882 9.99497 9.1666 9.53649L9.00008 9.38744L8.99972 3.50003C8.99972 2.6716 8.32815 2 7.49972 2ZM8.0002 5.9999C8.0002 5.72376 7.77634 5.4999 7.5002 5.4999C7.22405 5.4999 7.0002 5.72376 7.0002 5.9999V10.0851C6.4174 10.2909 5.9998 10.8466 5.9998 11.4999C5.9998 12.3283 6.67138 12.9999 7.4998 12.9999C8.32823 12.9999 8.9998 12.3283 8.9998 11.4999C8.9998 10.8469 8.58259 10.2914 8.0002 10.0854V5.9999Z)PATH";
             break;
         case ResourceKind::Overview:
-            add({{1,2},{15,2},{15,11},{1,11}}, true);
-            add({{8,11},{8,14}}); add({{5,14},{11,14}});
-            add({{3,8},{5,8},{7,5},{9,9},{11,6},{13,6}});
+            data = LR"PATH(M3.75 2C2.7835 2 2 2.7835 2 3.75V12.25C2 13.2165 2.7835 14 3.75 14H12.25C13.2165 14 14 13.2165 14 12.25V3.75C14 2.7835 13.2165 2 12.25 2H3.75ZM3 3.75C3 3.33579 3.33579 3 3.75 3H12.25C12.6642 3 13 3.33579 13 3.75V12.25C13 12.6642 12.6642 13 12.25 13H3.75C3.33579 13 3 12.6642 3 12.25V3.75ZM6 6.5C6 6.22386 5.77614 6 5.5 6C5.22386 6 5 6.22386 5 6.5V10.5C5 10.7761 5.22386 11 5.5 11C5.77614 11 6 10.7761 6 10.5V6.5ZM8 8C8.27614 8 8.5 8.22386 8.5 8.5V10.5C8.5 10.7761 8.27614 11 8 11C7.72386 11 7.5 10.7761 7.5 10.5V8.5C7.5 8.22386 7.72386 8 8 8ZM11 5.5C11 5.22386 10.7761 5 10.5 5C10.2239 5 10 5.22386 10 5.5V10.5C10 10.7761 10.2239 11 10.5 11C10.7761 11 11 10.7761 11 10.5V5.5Z)PATH";
+            break;
+        case ResourceKind::DiskActivity:
+            data = LR"PATH(M8 1C11.866 1 15 4.13401 15 8C15 11.866 11.866 15 8 15C4.13401 15 1 11.866 1 8C1 4.13401 4.13401 1 8 1ZM8 2C4.68629 2 2 4.68629 2 8C2 11.3137 4.68629 14 8 14C11.3137 14 14 11.3137 14 8C14 4.68629 11.3137 2 8 2ZM8 3C8.1873 3 8.3724 3.01013 8.55469 3.03027C8.82903 3.0606 9.02719 3.30771 8.99707 3.58203C8.96674 3.85642 8.71969 4.05461 8.44531 4.02441C8.29935 4.00828 8.15061 4 8 4C5.79086 4 4 5.79086 4 8C4 9.25635 4.5791 10.3772 5.48633 11.1113C5.70073 11.2851 5.7332 11.5999 5.55957 11.8145C5.38583 12.029 5.07105 12.0623 4.85645 11.8887C3.7248 10.9728 3 9.57081 3 8C3 5.23858 5.23858 3 8 3ZM12.418 7.00293C12.6923 6.97281 12.9394 7.17097 12.9697 7.44531C12.9899 7.6276 13 7.8127 13 8C13 9.57081 12.2752 10.9728 11.1436 11.8887C10.9289 12.0623 10.6142 12.029 10.4404 11.8145C10.2668 11.5999 10.2993 11.2851 10.5137 11.1113C11.4209 10.3772 12 9.25635 12 8C12 7.84938 11.9917 7.70065 11.9756 7.55469C11.9454 7.28031 12.1436 7.03326 12.418 7.00293ZM10.2109 4.93262C10.5019 4.74095 10.7953 4.42643 11.1318 4.5166C11.2138 4.53856 11.2912 4.58219 11.3555 4.64648C11.4207 4.71176 11.4637 4.79071 11.4854 4.87402C11.5722 5.20877 11.261 5.49858 11.0703 5.78711C10.5034 6.645 9.25687 8.50876 8.88379 8.88184C8.39567 9.3698 7.60433 9.3698 7.11621 8.88184C6.6281 8.39373 6.6282 7.60242 7.11621 7.11426C7.48885 6.74161 9.35058 5.49934 10.2109 4.93262Z)PATH";
+            break;
+        case ResourceKind::DiskWrite:
+            data = LR"PATH(M3.5 13H12.5C12.7761 13 13 13.2239 13 13.5C13 13.7455 12.8231 13.9496 12.5899 13.9919L12.5 14H3.5C3.22386 14 3 13.7761 3 13.5C3 13.2545 3.17688 13.0504 3.41012 13.0081L3.5 13H12.5H3.5ZM7.91012 1.00806L8 1C8.24546 1 8.44961 1.17688 8.49194 1.41012L8.5 1.5V10.292L11.182 7.61091C11.3555 7.43735 11.625 7.41806 11.8198 7.55306L11.8891 7.61091C12.0627 7.78448 12.0819 8.0539 11.9469 8.24877L11.8891 8.31802L8.35355 11.8536C8.17999 12.0271 7.91056 12.0464 7.71569 11.9114L7.64645 11.8536L4.11091 8.31802C3.91565 8.12276 3.91565 7.80617 4.11091 7.61091C4.28448 7.43735 4.5539 7.41806 4.74877 7.55306L4.81802 7.61091L7.5 10.292V1.5C7.5 1.25454 7.67688 1.05039 7.91012 1.00806L8 1L7.91012 1.00806Z)PATH";
             break;
     }
+    if (!data) return Media::PathGeometry();
+    std::wstring xaml = LR"XAML(<Path xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Data=")XAML";
+    xaml += data;
+    xaml += LR"XAML("/>)XAML";
+    auto path = Markup::XamlReader::Load(xaml).as<Shapes::Path>();
+    auto geometry = path.Data().as<Media::PathGeometry>();
+    path.Data(nullptr);  // Detach the parsed geometry before assigning it elsewhere.
     return geometry;
 }
+
 struct NativeRow {
     Controls::Grid grid{nullptr};
     Shapes::Path icon{nullptr};
@@ -1537,7 +1689,11 @@ struct NativePanel {
     size_t overviewRowsPerGroup = 0;
     size_t overviewGroupCount = 0;
     std::vector<std::array<Controls::TextBlock, 3>> overviewCells;
+    std::vector<Controls::Grid> overviewLabelHosts;
+    std::vector<Shapes::Path> overviewRowIcons;
+    std::vector<Controls::TextBlock> overviewExpanders;
     std::vector<std::wstring> overviewKeys;
+    std::set<std::wstring> expandedGpuGroups;
     RuntimeSnapshot latest;
     winrt::event_token tappedToken{};
     DispatcherTimer overviewTimer{nullptr};
@@ -1566,6 +1722,13 @@ struct NativePanel {
         return Media::SolidColorBrush(winrt::Windows::UI::Color{255, GetRValue(rgb), GetGValue(rgb), GetBValue(rgb)});
     }
 
+    void ToggleGpuGroup(const std::wstring& group) {
+        if (group.empty()) return;
+        if (!expandedGpuGroups.erase(group)) expandedGpuGroups.insert(group);
+        overviewKeys.clear();
+        RefreshOverview();
+    }
+
     void RefreshOverview() {
         if (!overviewContent) return;
         const bool light = QueryLightTheme();
@@ -1580,7 +1743,10 @@ struct NativePanel {
             std::max<ULONGLONG>(5000, 3ULL * g_settings.updateIntervalMs.load());
         std::vector<const OverviewRow*> visible;
         if (!stale) for (const auto& row : latest.overview)
-            if (row.available) visible.push_back(&row);
+            if (row.available && (row.gpuGroup.empty() || row.gpuSummary ||
+                                  expandedGpuGroups.find(row.gpuGroup) != expandedGpuGroups.end())) {
+                visible.push_back(&row);
+            }
         overviewTable.Visibility(visible.empty() ? Visibility::Collapsed : Visibility::Visible);
         overviewEmpty.Visibility(visible.empty() ? Visibility::Visible : Visibility::Collapsed);
         overviewEmpty.Text(stale ? L"采样已过期，暂无可用读数" : L"暂无可用读数");
@@ -1600,6 +1766,9 @@ struct NativePanel {
             overviewTable.RowDefinitions().Clear();
             overviewTable.ColumnDefinitions().Clear();
             overviewCells.clear();
+            overviewLabelHosts.clear();
+            overviewRowIcons.clear();
+            overviewExpanders.clear();
             overviewKeys.clear();
             overviewRowsPerGroup = rowsPerGroup;
             overviewGroupCount = groups;
@@ -1622,7 +1791,8 @@ struct NativePanel {
                 overviewTable.RowDefinitions().Append(definition);
             }
             const std::array<const wchar_t*, 3> headers{L"参数", L"当前值", L"近 1h 最值"};
-            const auto makeCells = [&](size_t rowIndex, size_t group) {
+            const auto makeCells = [&](size_t rowIndex, size_t group,
+                                       const OverviewRow* data = nullptr) {
                 std::array<Controls::TextBlock, 3> cells;
                 for (size_t j = 0; j < cells.size(); ++j) {
                     auto& text = cells[j];
@@ -1632,19 +1802,72 @@ struct NativePanel {
                     text.VerticalAlignment(VerticalAlignment::Center);
                     text.Margin(Thickness{0, 4, j + 1 == cells.size() ? 0.0 : 8.0, 4});
                     text.Foreground(TextBrush());
-                    Controls::Grid::SetRow(text, static_cast<int>(rowIndex));
-                    Controls::Grid::SetColumn(text, static_cast<int>(group * 4 + j));
-                    overviewTable.Children().Append(text);
+                    if (j || !data) {
+                        Controls::Grid::SetRow(text, static_cast<int>(rowIndex));
+                        Controls::Grid::SetColumn(text, static_cast<int>(group * 4 + j));
+                        overviewTable.Children().Append(text);
+                    }
                     if (rowIndex == 0) {
                         text.Text(headers[j]);
                         text.FontWeight(winrt::Windows::UI::Text::FontWeight{600});
                     }
                 }
+                if (data) {
+                    Controls::Grid labelHost;
+                    labelHost.VerticalAlignment(VerticalAlignment::Center);
+                    labelHost.Margin(Thickness{0, 0, 8, 0});
+                    Controls::ColumnDefinition expanderColumn;
+                    expanderColumn.Width(GridLength{data->gpuSummary ? 12.0 : 0.0, GridUnitType::Pixel});
+                    Controls::ColumnDefinition iconColumn;
+                    iconColumn.Width(GridLength{data->icon ? 14.0 : 0.0, GridUnitType::Pixel});
+                    Controls::ColumnDefinition gapColumn;
+                    gapColumn.Width(GridLength{data->icon ? 4.0 : 0.0, GridUnitType::Pixel});
+                    Controls::ColumnDefinition textColumn;
+                    textColumn.Width(GridLength{1, GridUnitType::Star});
+                    labelHost.ColumnDefinitions().Append(expanderColumn);
+                    labelHost.ColumnDefinitions().Append(iconColumn);
+                    labelHost.ColumnDefinitions().Append(gapColumn);
+                    labelHost.ColumnDefinitions().Append(textColumn);
+
+                    Controls::TextBlock expander;
+                    expander.FontFamily(Media::FontFamily(L"Segoe UI Symbol"));
+                    expander.FontSize(10);
+                    expander.IsTextScaleFactorEnabled(false);
+                    expander.VerticalAlignment(VerticalAlignment::Center);
+                    expander.Text(data->gpuSummary
+                        ? (expandedGpuGroups.find(data->gpuGroup) != expandedGpuGroups.end()
+                            ? L"\u25BE" : L"\u25B8") : L"");
+                    Controls::Grid::SetColumn(expander, 0);
+                    labelHost.Children().Append(expander);
+
+                    Shapes::Path icon;
+                    icon.Width(13);
+                    icon.Height(13);
+                    icon.Stretch(Media::Stretch::Uniform);
+                    icon.VerticalAlignment(VerticalAlignment::Center);
+                    if (data->icon) icon.Data(BuildIconGeometry(*data->icon));
+                    else icon.Visibility(Visibility::Collapsed);
+                    Controls::Grid::SetColumn(icon, 1);
+                    labelHost.Children().Append(icon);
+
+                    Controls::Grid::SetColumn(cells[0], 3);
+                    labelHost.Children().Append(cells[0]);
+                    Controls::Grid::SetRow(labelHost, static_cast<int>(rowIndex));
+                    Controls::Grid::SetColumn(labelHost, static_cast<int>(group * 4));
+                    if (data->gpuSummary) {
+                        const auto gpuGroup = data->gpuGroup;
+                        labelHost.Tapped([this, gpuGroup](auto&&, auto&&) { ToggleGpuGroup(gpuGroup); });
+                    }
+                    overviewTable.Children().Append(labelHost);
+                    overviewLabelHosts.push_back(labelHost);
+                    overviewRowIcons.push_back(icon);
+                    overviewExpanders.push_back(expander);
+                }
                 return cells;
             };
             for (size_t group = 0; group < groups; ++group) makeCells(0, group);
             for (size_t i = 0; i < visible.size(); ++i) {
-                overviewCells.push_back(makeCells(i % rowsPerGroup + 1, i / rowsPerGroup));
+                overviewCells.push_back(makeCells(i % rowsPerGroup + 1, i / rowsPerGroup, visible[i]));
                 overviewKeys.push_back(visible[i]->key);
             }
         }
@@ -1664,6 +1887,8 @@ struct NativePanel {
                 L"\n最值统计最近 1 小时；运行不足 1 小时时按已有有效样本统计。"));
             for (size_t j = 0; j < cells.size(); ++j)
                 cells[j].Foreground(TextBrush(j < 2 ? row.severity : Severity::Normal));
+            overviewExpanders[i].Foreground(TextBrush(row.severity));
+            overviewRowIcons[i].Fill(TextBrush(row.severity));
         }
     }
 
@@ -1831,11 +2056,7 @@ struct NativePanel {
             operation = L"Create vector icon";
             row.icon = Shapes::Path();
             row.icon.Stretch(Media::Stretch::Uniform);
-            row.icon.StrokeThickness(1);
-            row.icon.StrokeStartLineCap(Media::PenLineCap::Round);
-            row.icon.StrokeEndLineCap(Media::PenLineCap::Round);
-            row.icon.StrokeLineJoin(Media::PenLineJoin::Round);
-            row.icon.Fill(nullptr);
+            row.icon.Stroke(nullptr);
             row.icon.VerticalAlignment(VerticalAlignment::Center);
             Controls::Grid::SetColumn(row.icon, 1);
 
@@ -2007,7 +2228,7 @@ struct NativePanel {
 
             auto brush = TextBrush(item.severity);
             operation = L"Update native text";
-            row.icon.Stroke(brush);
+            row.icon.Fill(brush);
             row.value.Foreground(brush);
             row.value.FontSize(metrics->fontSize);
             row.value.Text(item.value);
@@ -2285,13 +2506,18 @@ void UpdateAlertState(GpuCollector& gpuCollector, DiskIoCollector& diskCollector
     UpdateTracker(&Tracker(ResourceKind::Monitor),
         !coreValid || gpuFailure ? Severity::Warning : Severity::Normal, sustain);
     if (coreValid) {
-        UpdateKnownTracker(&Tracker(ResourceKind::Cpu), sample.cpuPct, CpuSeverity(sample),
-                           g_settings.cpuWarningSeconds.load());
+        UpdateAccumulatingWarning(&Tracker(ResourceKind::Cpu), sample.cpuPct,
+            CpuSeverity(sample), g_settings.cpuWarningSeconds.load(),
+            g_settings.highUsageGapSeconds.load());
         UpdateTracker(&Tracker(ResourceKind::Memory), MemorySeverity(sample), sustain);
         UpdateTracker(&Tracker(ResourceKind::Commit), CommitSeverity(sample), sustain);
         UpdateTracker(&Tracker(ResourceKind::Disk), DiskSeverity(sample), sustain);
-        UpdateKnownTracker(&Tracker(ResourceKind::DiskActivity), sample.diskActivityPct,
-            DiskActivitySeverity(sample), g_settings.diskActivityWarningSeconds.load());
+        UpdateAccumulatingWarning(&Tracker(ResourceKind::DiskActivity), sample.diskActivityPct,
+            DiskActivitySeverity(sample), g_settings.diskActivityWarningSeconds.load(),
+            g_settings.highUsageGapSeconds.load());
+        UpdateAccumulatingWarning(&Tracker(ResourceKind::DiskWrite), sample.diskWriteBps,
+            DiskWriteSeverity(sample), g_settings.diskWriteWarningSeconds.load(),
+            g_settings.diskWriteGapSeconds.load());
     }
     UpdateKnownTracker(&Tracker(ResourceKind::CpuTemperature), sample.cpuTemperature,
         ThresholdSeverity(sample.cpuTemperature, g_settings.cpuTemperatureWarning, g_settings.cpuTemperatureCritical), sustain);

@@ -2,26 +2,27 @@
 
 Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时显示透明的「图标 + 数值」，点击后展开圆角资源总表。
 
-**版本：0.7.0 · 许可证：GPL-3.0-only · 平台：Windows 11 x64**
+**版本：0.8.0 · 许可证：GPL-3.0-only · 平台：Windows 11 x64**
 
-![原生资源总表与三项单列告警布局](docs/resource-overview.png)
+![原生资源总表、GPU 独立折叠与三项单列告警布局](docs/resource-overview.jpg)
 
 展示图由新版原生组件和模拟数据生成；背景为示意，不包含真实桌面、资源读数或设备信息。
 
 ## 功能
 
 - CPU、物理内存、提交内存、系统盘剩余空间 / 活动率 / 读写速度，以及各物理 GPU 的负载、显存和可用核心温度。
-- 重新设计整套任务栏矢量图标：CPU 芯片、内存条、提交页、磁盘容量、磁盘繁忙、GPU 卡、显存芯片和温度使用不同轮廓，在紧凑尺寸下更易区分。
+- 任务栏和总表统一使用微软 Fluent UI System Icons 的 16 px 矢量轮廓：CPU 芯片、内存条、提交页、硬盘、仪表、持续写入、显示设备、显存和温度均可直接区分。
 - 告警位于系统托盘左侧。恰好三项时缩小内容并放在一列；四项及以上恢复每列上下两项，向左扩展。
 - 使用原生 XAML 文本与矢量图标，保留抗锯齿。任务栏内无底色，不创建独立悬浮窗口。
 - 没有告警时完全隐藏，不保留入口图标、不占任务栏空间。
 - 点击告警打开三列表格：参数、当前值、近 1h 最值。严重、告警和确认中的项目优先。
+- 有对应图标的参数会在名称前显示图标。每张物理 GPU 有独立折叠行；折叠时只显示该卡的负载、专用显存和温度，展开后显示完整读数，多张显卡互不混合。
 - 无法读取或过期的数据不列入表格。整表无需滚动或翻页；内容过多时并排排列，极小工作区下按需缩放。
 - 最值使用滚动一小时的有效采样：磁盘可用空间取最低值，其他参数取最高值，不再附加最低值箭头。窗口到期的样本自动移出。
 - 运行不足一小时时只统计已有数据；数据仅保存在内存中，不生成历史文件。
-- 系统盘活动率可触发持续高占用告警；读写速度显示当前值和近 1h 峰值，但不套用统一告警阈值，因为 HDD、SATA SSD 与 NVMe 的合理吞吐范围不同。
+- 系统盘活动率达到 90% 会累计繁忙时间；写入达到 5 MiB/s 会累计持续写盘时间。两者允许最多 5 秒短暂回落，分别累计 60 秒和 180 秒后告警。读取速度仅作诊断；写入规则用于发现持续后台流量，不代表磁盘健康或性能上限。
 
-图标含义：方形芯片 = CPU，横向内存条 = 物理内存，重叠页面 = 提交内存，圆柱盘 = 剩余空间，带盘片的硬盘 = 磁盘活动率，扩展卡 = GPU，带存储块的方形芯片 = 专用显存，温度计旁的小芯片 / 扩展卡 = CPU / GPU 温度。
+图标含义：芯片 = CPU，内存条 = 物理内存，带加号的文档 = 提交内存，硬盘 = 剩余空间，仪表 = 磁盘活动率，向下箭头 = 持续写入，显示器 = GPU，内存芯片 = 专用显存，温度计 = 温度。小尺寸下不再拼接两个设备图案。
 
 ## 安装
 
@@ -60,12 +61,14 @@ Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时
 
 | 指标 | 告警 | 严重 |
 | --- | --- | --- |
-| CPU / GPU 使用率 | 95%，持续 30 秒 | 不将高负载直接判定为硬件故障 |
+| CPU 使用率 | 95%，累计 30 秒，允许 5 秒回落 | 不将高负载直接判定为硬件故障 |
+| GPU 使用率 | 95%，持续 30 秒 | 不将高负载直接判定为硬件故障 |
 | 物理内存 | 可用空间低于 10% 且低于 4 GiB | 低于 1% 且低于 500 MiB |
 | 提交内存 | 85% | 95% |
 | 系统盘可用空间 | 低于 10% 且低于 10 GiB | 低于 5% 且低于 3 GiB |
-| 系统盘活动率 | 95%，持续 30 秒 | 不将高活动率直接判定为硬件故障 |
-| 系统盘读写速度 | 诊断指标，无统一阈值 | — |
+| 系统盘活动率 | 90%，累计 60 秒，允许 5 秒回落 | 不将高活动率直接判定为硬件故障 |
+| 系统盘写入速度 | ≥5 MiB/s，累计 180 秒，允许 5 秒回落 | 用于发现持续写盘，不是健康阈值 |
+| 系统盘读取速度 | 诊断指标，无统一阈值 | — |
 | 专用显存 | 90% | 97% |
 | GPU 核心温度 | 80°C | 87°C |
 | CPU 温度 | 90°C | 95°C |
@@ -92,10 +95,10 @@ Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时
 
 本项目采用 [GNU GPL v3.0](LICENSE)，SPDX 标识为 `GPL-3.0-only`。
 
-任务栏宿主访问部分改编自 m417z 的 **Taskbar tray icon spacing and grid**。保留上游署名与许可说明，详见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+任务栏宿主访问部分改编自 m417z 的 **Taskbar tray icon spacing and grid**。图标来自 Microsoft **Fluent UI System Icons**（MIT）。两者均保留署名与许可说明，详见 [第三方说明](THIRD_PARTY_NOTICES.md)。
 
 ## English summary
 
-A native Windhawk resource-alert component for the Windows 11 x64 taskbar. It displays only sustained alerts and hides completely when healthy. System-drive active time can alert; read/write throughput is shown as a diagnostic current value and rolling one-hour maximum. Distinct vector silhouettes improve recognition at taskbar size. Exactly three alerts use one compact three-row column; four or more use normal two-row columns. Click an alert for a rounded, non-scrolling overview with rolling one-hour extrema, unavailable readings omitted and alerts sorted first. The demonstration image uses simulated data.
+A native Windhawk resource-alert component for the Windows 11 x64 taskbar. It displays only sustained alerts and hides completely when healthy. CPU load, system-drive active time, and sustained writes use accumulated-duration rules with short-gap tolerance. Microsoft Fluent UI System Icons improve recognition at taskbar size. Exactly three alerts use one compact three-row column; four or more use normal two-row columns. Click an alert for a rounded, non-scrolling overview with rolling one-hour extrema, parameter icons, and independently collapsible per-GPU summaries. The JPEG demonstration image uses simulated data.
 
 Install by copying the complete `.wh.cpp` file into Windhawk's new-mod editor and pressing Ctrl+B. GPU/temperature support depends on the driver and optional local sensor providers. No telemetry or cloud-upload code is included. See [privacy details](PRIVACY.md) and [third-party attribution](THIRD_PARTY_NOTICES.md).
