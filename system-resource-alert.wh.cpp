@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.6.0
+// @version         0.7.0
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -31,6 +31,7 @@ just before the system tray (to the left of the overflow arrow):
 - Memory icon + utilization percentage
 - Commit icon + commit-limit percentage
 - System-drive icon + free GB
+- Disk-activity icon + active-time percentage
 - GPU card icon + utilization percentage (per adapter)
 - VRAM icon + dedicated-memory percentage (per adapter)
 - CPU/GPU thermometer icon + degrees Celsius
@@ -62,6 +63,9 @@ Hover a current value for its status or a parameter for device/source details.
 All readable rows are shown at once, without scrolling or pagination. The card
 grows to its content and splits long tables into adjacent groups. On unusually
 small screens it scales down only as needed to remain inside the work area.
+Disk active time is a sustained warning metric. System-drive read/write rates
+are diagnostic rows in the overview with rolling one-hour maxima; throughput
+has no universal warning threshold because storage devices differ greatly.
 The table refreshes while open. Extrema cover available samples from the most
 recent hour (or the shorter time since startup) and remain in memory only; free
 disk space records its minimum while other metrics record their maximum. No
@@ -157,6 +161,11 @@ taskbar is supported in this version.
   $name: Commit warning percentage
 - commitCriticalPct: 95
   $name: Commit critical percentage
+- diskActivityWarningPct: 95
+  $name: System-drive activity warning percentage
+- diskActivityWarningSeconds: 30
+  $name: System-drive activity warning duration
+  $description: System-drive active time must stay above the threshold for this many seconds. Read/write throughput is diagnostic only and has no universal alert threshold.
 - diskWarningPct: 10
   $name: Disk warning percentage
 - diskCriticalPct: 5
@@ -235,9 +244,9 @@ namespace {
 
 using namespace winrt::Windows::UI::Xaml;
 constexpr wchar_t kComponentName[] = L"WindhawkSystemResourceAlertComponent";
-constexpr size_t kResourceCount = 10;
+constexpr size_t kResourceCount = 11;
 constexpr size_t kMaxGpus = 8;
-constexpr size_t kMaxAlerts = 6 + 3 * kMaxGpus;
+constexpr size_t kMaxAlerts = 7 + 3 * kMaxGpus;
 constexpr size_t kMaxColumns = (kMaxAlerts + 1) / 2;
 
 enum class Severity : int {
@@ -257,6 +266,7 @@ enum class ResourceKind : size_t {
     GpuTemperature = 7,
     CpuTemperature = 8,
     Overview = 9,
+    DiskActivity = 10,
 };
 
 struct Settings {
@@ -280,6 +290,8 @@ struct Settings {
     std::atomic<int> diskCriticalPct{5};
     std::atomic<int> diskWarningGB{10};
     std::atomic<int> diskCriticalGB{3};
+    std::atomic<int> diskActivityWarningPct{95};
+    std::atomic<int> diskActivityWarningSeconds{30};
     std::atomic<int> cpuWarningPct{95};
     std::atomic<int> cpuWarningSeconds{30};
     std::atomic<int> warningSustainSeconds{5};
@@ -309,6 +321,9 @@ struct ResourceSample {
     double commitPct = 0.0;
     double diskFreePct = 0.0;
     double diskFreeGB = 0.0;
+    double diskActivityPct = -1.0;
+    double diskReadBps = -1.0;
+    double diskWriteBps = -1.0;
     double physicalTotalGB = 0, commitUsedGB = 0, commitLimitGB = 0, diskTotalGB = 0;
     DWORD processCount = 0, threadCount = 0, handleCount = 0;
     wchar_t diskLetter = L'C';
@@ -462,6 +477,10 @@ void LoadSettings() {
     g_settings.diskCriticalGB =
         ClampInt(Wh_GetIntSetting(L"diskCriticalGB"), 1,
                  g_settings.diskWarningGB.load());
+    g_settings.diskActivityWarningPct =
+        ClampInt(Wh_GetIntSetting(L"diskActivityWarningPct"), 50, 100);
+    g_settings.diskActivityWarningSeconds =
+        ClampInt(Wh_GetIntSetting(L"diskActivityWarningSeconds"), 1, 600);
     g_settings.cpuWarningPct =
         ClampInt(Wh_GetIntSetting(L"cpuWarningPct"), 50, 100);
     g_settings.cpuWarningSeconds =
@@ -576,6 +595,71 @@ bool QueryResourceSample(ResourceSample* sample) {
     *sample = current;
     return true;
 }
+
+struct DiskIoCollector {
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER activity = nullptr, read = nullptr, write = nullptr;
+    wchar_t drive = L'\0';
+
+    ~DiskIoCollector() { Reset(); }
+
+    void Reset() {
+        if (query) PdhCloseQuery(query);
+        query = nullptr;
+        activity = read = write = nullptr;
+        drive = L'\0';
+    }
+
+    bool Ensure(wchar_t requestedDrive) {
+        requestedDrive = static_cast<wchar_t>(std::towupper(requestedDrive));
+        if (query && drive == requestedDrive) return true;
+        Reset();
+        if (requestedDrive < L'A' || requestedDrive > L'Z' ||
+            PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+            Reset();
+            return false;
+        }
+        wchar_t path[96]{};
+        const auto add = [&](const wchar_t* metric, PDH_HCOUNTER* counter) {
+            swprintf_s(path, L"\\LogicalDisk(%c:)\\%s", requestedDrive, metric);
+            return PdhAddEnglishCounterW(query, path, 0, counter) == ERROR_SUCCESS;
+        };
+        if (!add(L"% Disk Time", &activity) ||
+            !add(L"Disk Read Bytes/sec", &read) ||
+            !add(L"Disk Write Bytes/sec", &write) ||
+            PdhCollectQueryData(query) != ERROR_SUCCESS) {
+            Reset();
+            return false;
+        }
+        drive = requestedDrive;
+        return false; // The first collection only primes rate counters.
+    }
+
+    static double Value(PDH_HCOUNTER counter) {
+        if (!counter) return -1;
+        PDH_FMT_COUNTERVALUE value{};
+        if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
+                                        nullptr, &value) != ERROR_SUCCESS ||
+            (value.CStatus != PDH_CSTATUS_VALID_DATA &&
+             value.CStatus != PDH_CSTATUS_NEW_DATA) ||
+            !std::isfinite(value.doubleValue) || value.doubleValue < 0) {
+            return -1;
+        }
+        return value.doubleValue;
+    }
+
+    void Sample(ResourceSample* sample) {
+        if (!sample || !sample->valid || !Ensure(sample->diskLetter)) return;
+        if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
+            Reset();
+            return;
+        }
+        const double active = Value(activity);
+        sample->diskActivityPct = active < 0 ? -1 : std::clamp(active, 0.0, 100.0);
+        sample->diskReadBps = Value(read);
+        sample->diskWriteBps = Value(write);
+    }
+};
 
 // Read-only GPU APIs. These small x64 ABI declarations mirror the Windows SDK
 // d3dkmthk.h structures; Windhawk's bundled MinGW headers omit that header.
@@ -1023,6 +1107,12 @@ Severity DiskSeverity(const ResourceSample& sample) {
     return Severity::Normal;
 }
 
+Severity DiskActivitySeverity(const ResourceSample& sample) {
+    return std::isfinite(sample.diskActivityPct) && sample.diskActivityPct >= 0 &&
+           sample.diskActivityPct >= g_settings.diskActivityWarningPct.load()
+        ? Severity::Warning : Severity::Normal;
+}
+
 void UpdateTracker(AlertTracker* tracker,
                    Severity raw,
                    int warningSustainSeconds) {
@@ -1099,6 +1189,17 @@ std::wstring FormatNumber(double value, const wchar_t* suffix, int precision = 1
     return buffer;
 }
 
+std::wstring FormatRate(double bytesPerSecond) {
+    if (!std::isfinite(bytesPerSecond) || bytesPerSecond < 0) return L"--";
+    constexpr double kib = 1024.0;
+    constexpr double mib = kib * 1024.0;
+    constexpr double gib = mib * 1024.0;
+    if (bytesPerSecond < kib) return FormatNumber(bytesPerSecond, L" B/s", 0);
+    if (bytesPerSecond < mib) return FormatNumber(bytesPerSecond / kib, L" KiB/s");
+    if (bytesPerSecond < gib) return FormatNumber(bytesPerSecond / mib, L" MiB/s");
+    return FormatNumber(bytesPerSecond / gib, L" GiB/s");
+}
+
 Severity ThresholdSeverity(double value, double warning, double critical) {
     if (!std::isfinite(value) || value < 0) return Severity::Normal;
     if (value >= critical) return Severity::Critical;
@@ -1127,10 +1228,11 @@ std::vector<AlertItem> BuildAlertItems() {
         items.push_back({ResourceKind::Monitor, monitorSeverity, L"ERR"});
     }
 
-    const auto append = [&](ResourceKind kind, std::wstring value) {
+    const auto append = [&](ResourceKind kind, std::wstring value,
+                            std::wstring label = L"") {
         const Severity severity = Tracker(kind).displayed;
         if (severity != Severity::Normal) {
-            items.push_back({kind, severity, std::move(value)});
+            items.push_back({kind, severity, std::move(value), std::move(label)});
         }
     };
 
@@ -1138,6 +1240,9 @@ std::vector<AlertItem> BuildAlertItems() {
     append(ResourceKind::Memory, g_lastSample.valid ? FormatPercent(g_lastSample.ramUsedPct) : L"--");
     append(ResourceKind::Commit, g_lastSample.valid ? FormatPercent(g_lastSample.commitPct) : L"--");
     append(ResourceKind::Disk, g_lastSample.valid ? FormatDisk(g_lastSample.diskFreeGB) : L"--");
+    append(ResourceKind::DiskActivity, FormatPercent(g_lastSample.diskActivityPct),
+        std::wstring(1, g_lastSample.diskLetter) + L": 活动率 / 读 " +
+        FormatRate(g_lastSample.diskReadBps) + L" / 写 " + FormatRate(g_lastSample.diskWriteBps));
     append(ResourceKind::CpuTemperature, FormatNumber(g_lastSample.cpuTemperature, L"\u00B0", 0));
     for (size_t i = 0; i < g_lastSample.gpus.size(); ++i) {
         const auto& gpu = g_lastSample.gpus[i];
@@ -1167,7 +1272,8 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
     const auto add = [&](std::wstring key, std::wstring label, double numeric,
                          std::wstring formatted, const wchar_t* peakSuffix,
                          std::wstring threshold, Severity displayed, Severity raw,
-                         bool minimum = false, int decimals = 1) {
+                         bool minimum = false, int decimals = 1,
+                         bool adaptiveRate = false) {
         const bool available = std::isfinite(numeric) && numeric >= 0;
         if (available) {
             auto [it, inserted] = g_extrema.try_emplace(key, RollingExtremum{minimum});
@@ -1185,7 +1291,8 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
             raw != Severity::Normal ? L"确认中" : L"正常";
         snapshot.overview.push_back({std::move(key), std::move(label),
             available ? std::move(formatted) : L"--",
-            !extremeValue ? L"--" : FormatNumber(*extremeValue, peakSuffix, decimals),
+            !extremeValue ? L"--" : adaptiveRate ? FormatRate(*extremeValue)
+                : FormatNumber(*extremeValue, peakSuffix, decimals),
             std::move(threshold), std::move(state), displayed, available, minimum});
     };
     const auto thresholds = [](int warning, int critical, const wchar_t* unit) {
@@ -1215,6 +1322,18 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
         L"<" + std::to_wstring(g_settings.diskWarningPct.load()) + L"%且<" + std::to_wstring(g_settings.diskWarningGB.load()) +
         L"GiB\n严重<" + std::to_wstring(g_settings.diskCriticalPct.load()) + L"%且<" + std::to_wstring(g_settings.diskCriticalGB.load()) + L"GiB",
         Tracker(ResourceKind::Disk).displayed, DiskSeverity(sample), true);
+    const std::wstring diskPrefix = std::wstring(1, sample.diskLetter) + L": ";
+    add(L"disk-activity", diskPrefix + L"活动率", sample.diskActivityPct,
+        FormatPercent(sample.diskActivityPct), L"%",
+        std::to_wstring(g_settings.diskActivityWarningPct.load()) + L"% · " +
+            std::to_wstring(g_settings.diskActivityWarningSeconds.load()) + L"秒",
+        Tracker(ResourceKind::DiskActivity).displayed, DiskActivitySeverity(sample), false, 0);
+    add(L"disk-read", diskPrefix + L"读取速度", sample.diskReadBps,
+        FormatRate(sample.diskReadBps), L"", L"诊断指标，无通用阈值",
+        Severity::Normal, Severity::Normal, false, 1, true);
+    add(L"disk-write", diskPrefix + L"写入速度", sample.diskWriteBps,
+        FormatRate(sample.diskWriteBps), L"", L"诊断指标，无通用阈值",
+        Severity::Normal, Severity::Normal, false, 1, true);
     add(L"processes", L"进程数", sample.valid ? sample.processCount : -1.0, std::to_wstring(sample.processCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
     add(L"threads", L"线程数", sample.valid ? sample.threadCount : -1.0, std::to_wstring(sample.threadCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
     add(L"handles", L"句柄数", sample.valid ? sample.handleCount : -1.0, std::to_wstring(sample.handleCount), L"", L"—", Severity::Normal, Severity::Normal, false, 0);
@@ -1311,53 +1430,66 @@ Media::PathGeometry BuildIconGeometry(ResourceKind kind) {
     switch (kind) {
         case ResourceKind::Cpu:
             add({{4,4},{12,4},{12,12},{4,12}}, true);
-            add({{6,1},{6,4}}); add({{10,1},{10,4}});
-            add({{6,12},{6,15}}); add({{10,12},{10,15}});
-            add({{1,6},{4,6}}); add({{1,10},{4,10}});
-            add({{12,6},{15,6}}); add({{12,10},{15,10}});
+            add({{6,6},{10,6},{10,10},{6,10}}, true);
+            for (float p : {6.f, 10.f}) {
+                add({{p,1},{p,4}}); add({{p,12},{p,15}});
+                add({{1,p},{4,p}}); add({{12,p},{15,p}});
+            }
             break;
         case ResourceKind::Memory:
-            add({{1,4},{15,4},{15,11},{1,11}}, true);
-            for (float x : {4.f, 8.f, 12.f}) add({{x,11},{x,14}});
+            add({{1,4},{15,4},{15,12},{1,12}}, true);
             for (float x : {3.f, 7.f, 11.f})
-                add({{x,6},{x+2,6},{x+2,9},{x,9}}, true);
+                add({{x,6},{x+2,6},{x+2,10},{x,10}}, true);
+            add({{3,12},{3,15}}); add({{6,12},{6,14}});
+            add({{10,12},{10,14}}); add({{13,12},{13,15}});
             break;
         case ResourceKind::Commit:
-            add({{8,1},{15,4},{8,7},{1,4}}, true);
-            add({{1,7},{8,10},{15,7}});
-            add({{1,10},{8,13},{15,10}});
+            add({{5,1},{14,1},{14,11},{5,11}}, true);
+            add({{2,4},{11,4},{11,15},{2,15}}, true);
+            add({{4,8},{9,8}}); add({{4,11},{9,11}});
             break;
         case ResourceKind::Disk:
-            add({{2,2},{14,2},{14,14},{2,14}}, true);
-            add({{2,10},{14,10}}); add({{11,12},{12,12}});
+            add({{2,4},{3,2},{6,1},{10,1},{13,2},{14,4},{13,6},{10,7},{6,7},{3,6},{2,4}});
+            add({{2,4},{2,12},{3,14},{6,15},{10,15},{13,14},{14,12},{14,4}});
+            add({{2,9},{3,11},{6,12},{10,12},{13,11},{14,9}});
+            break;
+        case ResourceKind::DiskActivity:
+            add({{1,2},{15,2},{15,14},{1,14}}, true);
+            add({{8,4},{10,5},{11,7},{10,9},{8,10},{6,9},{5,7},{6,5},{8,4}}, true);
+            add({{1,11},{15,11}}); add({{12,12.5f},{13,12.5f}});
             break;
         case ResourceKind::Monitor:
             add({{8,1},{15,14},{1,14}}, true);
             add({{8,5},{8,9}}); add({{8,11},{8,12}});
             break;
         case ResourceKind::Gpu:
-            add({{1,3},{14,3},{14,12},{1,12}}, true);
-            add({{1,1},{1,14}}); add({{4,12},{4,14},{10,14},{10,12}});
-            add({{9,5},{12,8},{9,10},{6,8},{9,5}}, true);
-            add({{3,5},{4,5}}); add({{3,8},{4,8}});
+            add({{1,3},{15,3},{15,12},{1,12}}, true);
+            add({{1,1},{1,14}}); add({{4,12},{4,15},{11,15},{11,12}});
+            add({{9,5},{11,6},{12,8},{11,10},{9,11},{7,10},{6,8},{7,6},{9,5}}, true);
+            add({{9,5},{9,11}}); add({{6,8},{12,8}});
+            add({{3,5},{4,5}}); add({{3,8},{4,8}}); add({{13,5},{14,5}});
             break;
         case ResourceKind::Vram:
-            add({{1,2},{15,2},{15,12},{1,12}}, true);
-            add({{3,4},{6,4},{6,9},{3,9}}, true);
-            add({{9,4},{12,4},{12,9},{9,9}}, true);
-            add({{4,12},{4,15}}); add({{8,12},{8,15}}); add({{12,12},{12,15}});
+            add({{3,3},{13,3},{13,13},{3,13}}, true);
+            add({{5,5},{8,5},{8,11},{5,11}}, true);
+            add({{9,5},{11,5},{11,11},{9,11}}, true);
+            for (float p : {5.f, 8.f, 11.f}) {
+                add({{p,1},{p,3}}); add({{p,13},{p,15}});
+                add({{1,p},{3,p}}); add({{13,p},{15,p}});
+            }
             break;
         case ResourceKind::CpuTemperature:
         case ResourceKind::GpuTemperature:
             add({{10,1},{13,1},{13,9},{15,11},{15,13},{13,15},{10,15},{8,13},{8,11},{10,9}}, true);
-            add({{11.5f,5},{11.5f,12}});
+            add({{11.5f,4},{11.5f,12}});
             if (kind == ResourceKind::CpuTemperature) {
-                add({{1,3},{6,3},{6,8},{1,8}}, true);
-                add({{2,1},{2,3}}); add({{5,1},{5,3}});
-                add({{2,8},{2,10}}); add({{5,8},{5,10}});
+                add({{1,4},{6,4},{6,9},{1,9}}, true);
+                add({{2,2},{2,4}}); add({{5,2},{5,4}});
+                add({{2,9},{2,11}}); add({{5,9},{5,11}});
             } else {
-                add({{1,2},{6,2},{6,10},{1,10}}, true);
-                add({{1,5},{6,5}}); add({{3,10},{3,12}});
+                add({{1,3},{6,3},{6,10},{1,10}}, true);
+                add({{1,1},{1,12}}); add({{2,6},{5,6}});
+                add({{3,10},{3,12}}); add({{5,10},{5,12}});
             }
             break;
         case ResourceKind::Overview:
@@ -2137,10 +2269,11 @@ LRESULT CALLBACK TaskbarSubclass(HWND window, UINT message, WPARAM wParam,
     return DefSubclassProc(window, message, wParam, lParam);
 }
 
-void UpdateAlertState(GpuCollector& gpuCollector) {
+void UpdateAlertState(GpuCollector& gpuCollector, DiskIoCollector& diskCollector) {
     ResourceSample sample{};
     const int sustain = g_settings.warningSustainSeconds.load();
     const bool coreValid = QueryResourceSample(&sample);
+    diskCollector.Sample(&sample);
     sample.gpus = gpuCollector.Sample();
     if (g_settings.enableCpuTemperature && g_cpuTemperatureTick &&
         GetTickCount64() - g_cpuTemperatureTick.load() <= 6000) {
@@ -2157,6 +2290,8 @@ void UpdateAlertState(GpuCollector& gpuCollector) {
         UpdateTracker(&Tracker(ResourceKind::Memory), MemorySeverity(sample), sustain);
         UpdateTracker(&Tracker(ResourceKind::Commit), CommitSeverity(sample), sustain);
         UpdateTracker(&Tracker(ResourceKind::Disk), DiskSeverity(sample), sustain);
+        UpdateKnownTracker(&Tracker(ResourceKind::DiskActivity), sample.diskActivityPct,
+            DiskActivitySeverity(sample), g_settings.diskActivityWarningSeconds.load());
     }
     UpdateKnownTracker(&Tracker(ResourceKind::CpuTemperature), sample.cpuTemperature,
         ThresholdSeverity(sample.cpuTemperature, g_settings.cpuTemperatureWarning, g_settings.cpuTemperatureCritical), sustain);
@@ -2175,14 +2310,16 @@ DWORD WINAPI MonitorThread(void*) {
     const HRESULT comInitialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     HANDLE waits[] = {g_stopEvent, g_wakeEvent};
     std::unique_ptr<GpuCollector> gpuCollector;
+    std::unique_ptr<DiskIoCollector> diskCollector;
     while (!g_unloading) {
         try {
             if (!gpuCollector) gpuCollector = std::make_unique<GpuCollector>();
+            if (!diskCollector) diskCollector = std::make_unique<DiskIoCollector>();
             if (g_resetRequested.exchange(false)) ResetTrackers();
             const ULONGLONG cpuStarted = g_cpuQueryStarted.load();
             if (cpuStarted && GetTickCount64() - cpuStarted > 1500 && g_cpuThreadId)
                 CoCancelCall(g_cpuThreadId, 0);
-            UpdateAlertState(*gpuCollector);
+            UpdateAlertState(*gpuCollector, *diskCollector);
             auto snapshot = BuildSnapshot();
             {
                 std::lock_guard guard(g_snapshotMutex);
@@ -2210,6 +2347,7 @@ DWORD WINAPI MonitorThread(void*) {
         }
     }
     gpuCollector.reset();
+    diskCollector.reset();
     if (SUCCEEDED(comInitialized)) CoUninitialize();
     return 0;
 }
