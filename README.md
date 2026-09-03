@@ -4,7 +4,7 @@ Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时
 
 **版本：0.8.2 · 许可证：GPL-3.0-only · 平台：Windows 11 x64**
 
-![原生资源总表、GPU 独立折叠与三项单列告警布局](docs/resource-overview.jpg)
+![原生资源总表、GPU 独立折叠与三项单列告警布局](docs/resource-overview-v0.8.2.jpg)
 
 展示图由新版原生组件和模拟数据生成；背景为示意，不包含真实桌面、资源读数或设备信息。
 
