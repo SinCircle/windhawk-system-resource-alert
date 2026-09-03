@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.5.2
+// @version         0.6.0
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -39,9 +39,9 @@ Amber means warning and red means critical. There is no panel background,
 border, or status label. Short spikes are ignored, and alerts remain visible
 briefly during recovery to avoid flickering.
 
-Each row is one icon plus its value. The first two alerts occupy the right
-column. Further alerts occupy new two-row columns to its left. More alerts do
-not shrink the font or icon size; the tray-side edge remains anchored.
+Each row is one icon plus its value. Exactly three alerts use one compact
+three-row column. One or two alerts use one normal column; four or more return
+to two rows per column and expand left. The tray-side edge remains anchored.
 The compact default uses 18-DIP rows with no extra row gap, including upgrades
 with older saved spacing. Enable Use custom row spacing to apply the saved
 Row height and Row gap instead. Font and icon sizes are unchanged.
@@ -54,7 +54,7 @@ The entire column can collapse when no resource is alerting. Native text and
 vector paths provide antialiasing without a bitmap or colored background.
 
 Click any alert to open a rounded native, light-dismiss
-flyout with three columns: parameter, current value, and session peak/minimum.
+flyout with three columns: parameter, current value, and rolling one-hour extremum.
 There is no title/timestamp block or threshold/status column. Critical,
 warning, and pending rows sort before normal rows; confirmed alerts are colored.
 Unavailable/stale readings are omitted from the table, not displayed as zero.
@@ -62,8 +62,10 @@ Hover a current value for its status or a parameter for device/source details.
 All readable rows are shown at once, without scrolling or pagination. The card
 grows to its content and splits long tables into adjacent groups. On unusually
 small screens it scales down only as needed to remain inside the work area.
-The table refreshes while open. Peak values are in memory only, not a historical
-log; free disk space records its minimum. Hiding an unavailable table row does
+The table refreshes while open. Extrema cover available samples from the most
+recent hour (or the shorter time since startup) and remain in memory only; free
+disk space records its minimum while other metrics record their maximum. No
+arrow is appended to minimum values. Hiding an unavailable table row does
 not confirm recovery from a previous alert: that alert remains until a valid
 reading confirms recovery. The flyout closes when the last alert clears.
 
@@ -222,6 +224,7 @@ taskbar is supported in this version.
 #include <vector>
 #include <map>
 #include <chrono>
+#include <deque>
 #include <string_view>
 #include <cstdio>
 #include <cstddef>
@@ -332,6 +335,7 @@ struct OverviewRow {
     std::wstring key, label, value, peak, threshold, state;
     Severity severity = Severity::Normal;
     bool available = true;
+    bool minimum = false;
 };
 struct RuntimeSnapshot {
     std::vector<AlertItem> alerts;
@@ -357,7 +361,34 @@ UINT g_dispatchMessage = 0;
 std::mutex g_snapshotMutex;
 RuntimeSnapshot g_snapshot;
 std::map<std::wstring, std::array<AlertTracker, 3>> g_gpuTrackers;
-std::map<std::wstring, double> g_peaks;
+constexpr ULONGLONG kExtremumWindowMs = 60ULL * 60 * 1000;
+struct ExtremumSample { ULONGLONG tick; double value; };
+struct RollingExtremum {
+    bool minimum = false;
+    std::deque<ExtremumSample> candidates;
+
+    void Expire(ULONGLONG now) {
+        while (!candidates.empty() && now >= candidates.front().tick &&
+               now - candidates.front().tick >= kExtremumWindowMs) {
+            candidates.pop_front();
+        }
+    }
+    void Add(ULONGLONG now, double value) {
+        Expire(now);
+        while (!candidates.empty() &&
+               (minimum ? candidates.back().value >= value
+                        : candidates.back().value <= value)) {
+            candidates.pop_back();
+        }
+        candidates.push_back({now, value});
+    }
+    std::optional<double> Value(ULONGLONG now) {
+        Expire(now);
+        if (candidates.empty()) return std::nullopt;
+        return candidates.front().value;
+    }
+};
+std::map<std::wstring, RollingExtremum> g_extrema;
 HANDLE g_cpuThread = nullptr;
 DWORD g_cpuThreadId = 0;
 std::atomic<double> g_cpuTemperature{-1};
@@ -1123,10 +1154,10 @@ std::vector<AlertItem> BuildAlertItems() {
     return items;
 }
 
-RuntimeSnapshot BuildSnapshot() {
+RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
     RuntimeSnapshot snapshot;
     snapshot.alerts = BuildAlertItems();
-    snapshot.tick = GetTickCount64();
+    snapshot.tick = tick;
     SYSTEMTIME now{};
     GetLocalTime(&now);
     wchar_t time[32];
@@ -1139,18 +1170,23 @@ RuntimeSnapshot BuildSnapshot() {
                          bool minimum = false, int decimals = 1) {
         const bool available = std::isfinite(numeric) && numeric >= 0;
         if (available) {
-            auto [it, inserted] = g_peaks.try_emplace(key, numeric);
-            if (!inserted) it->second = minimum ? std::min(it->second, numeric) : std::max(it->second, numeric);
+            auto [it, inserted] = g_extrema.try_emplace(key, RollingExtremum{minimum});
+            if (!inserted && it->second.minimum != minimum) {
+                it->second = RollingExtremum{minimum};
+            }
+            it->second.Add(tick, numeric);
         }
-        const auto peak = g_peaks.find(key);
+        auto extremum = g_extrema.find(key);
+        const auto extremeValue = extremum == g_extrema.end()
+            ? std::optional<double>{} : extremum->second.Value(tick);
         std::wstring state = !available ? L"不可用" :
             displayed == Severity::Critical ? L"严重" :
             displayed == Severity::Warning ? L"告警" :
             raw != Severity::Normal ? L"确认中" : L"正常";
         snapshot.overview.push_back({std::move(key), std::move(label),
             available ? std::move(formatted) : L"--",
-            peak == g_peaks.end() ? L"--" : FormatNumber(peak->second, peakSuffix, decimals),
-            std::move(threshold), std::move(state), displayed, available});
+            !extremeValue ? L"--" : FormatNumber(*extremeValue, peakSuffix, decimals),
+            std::move(threshold), std::move(state), displayed, available, minimum});
     };
     const auto thresholds = [](int warning, int critical, const wchar_t* unit) {
         return std::to_wstring(warning) + unit + L" / " + std::to_wstring(critical) + unit;
@@ -1175,7 +1211,7 @@ RuntimeSnapshot BuildSnapshot() {
         thresholds(g_settings.commitWarningPct, g_settings.commitCriticalPct, L"%"),
         Tracker(ResourceKind::Commit).displayed, CommitSeverity(sample), false, 0);
     add(L"disk", std::wstring(1, sample.diskLetter) + L": 可用空间", sample.valid ? sample.diskFreeGB : -1,
-        FormatNumber(sample.diskFreeGB, L"") + L" / " + FormatNumber(sample.diskTotalGB, L" GiB"), L" GiB↓",
+        FormatNumber(sample.diskFreeGB, L"") + L" / " + FormatNumber(sample.diskTotalGB, L" GiB"), L" GiB",
         L"<" + std::to_wstring(g_settings.diskWarningPct.load()) + L"%且<" + std::to_wstring(g_settings.diskWarningGB.load()) +
         L"GiB\n严重<" + std::to_wstring(g_settings.diskCriticalPct.load()) + L"%且<" + std::to_wstring(g_settings.diskCriticalGB.load()) + L"GiB",
         Tracker(ResourceKind::Disk).displayed, DiskSeverity(sample), true);
@@ -1205,6 +1241,11 @@ RuntimeSnapshot BuildSnapshot() {
     if (sample.cpuTemperature >= 0)
         snapshot.devices += L"CPU 温度来源：LibreHardwareMonitor（" +
             std::wstring(sample.cpuTemperatureSource == 1 ? L"本地 Web Server" : L"旧版 WMI") + L"，CPU 温度传感器最高值）。";
+    for (auto it = g_extrema.begin(); it != g_extrema.end();) {
+        it->second.Expire(tick);
+        if (it->second.candidates.empty()) it = g_extrema.erase(it);
+        else ++it;
+    }
     const auto priority = [](const OverviewRow& row) {
         if (row.severity == Severity::Critical) return 0;
         if (row.severity == Severity::Warning) return 1;
@@ -1225,23 +1266,29 @@ struct RowMetrics {
 };
 
 std::optional<RowMetrics> CalculateNativeRows(size_t count, double taskbarHeight) {
-    const size_t rows = std::min(count, size_t{2});
+    const size_t rows = std::min(count, count == 3 ? size_t{3} : size_t{2});
     if (count == 0 || count > kMaxAlerts || !std::isfinite(taskbarHeight) ||
         taskbarHeight < rows * 12.0) {
         return std::nullopt;
     }
     const double padding = std::min(2.0, (taskbarHeight - rows * 12.0) / 2.0);
     const double available = taskbarHeight - 2.0 * padding;
-    const bool custom = g_settings.useCustomRowSpacing.load();
+    const bool compactThree = count == 3;
+    const bool custom = g_settings.useCustomRowSpacing.load() && !compactThree;
     const int requestedGap = custom ? g_settings.rowGap.load() : 0;
-    const int requestedHeight = custom ? g_settings.rowHeight.load() : 18;
+    const int requestedHeight = compactThree ? 14 : custom ? g_settings.rowHeight.load() : 18;
     const double gap = rows == 1 ? 0.0 :
         std::min<double>(requestedGap,
                          (available - rows * 12.0) / (rows - 1));
     const double height = std::min<double>(
         requestedHeight, (available - (rows - 1) * gap) / rows);
-    return RowMetrics{height, gap, std::min(40.0 / 3.0, height - 1.0),
-                      std::min(15.0, height - 2.0)};
+    return RowMetrics{height, gap,
+                      std::min(compactThree ? 11.0 : 40.0 / 3.0, height - 1.0),
+                      std::min(compactThree ? 12.0 : 15.0, height - 2.0)};
+}
+
+constexpr size_t AlertRowsPerColumn(size_t count) {
+    return count == 3 ? 3 : 2;
 }
 
 Media::PathGeometry BuildIconGeometry(ResourceKind kind) {
@@ -1344,6 +1391,7 @@ struct NativePanel {
     Controls::Grid root{nullptr};
     // Index 0 is tray-side; subsequent two-row columns extend to the left.
     std::vector<Controls::StackPanel> columnPanels = std::vector<Controls::StackPanel>(kMaxColumns, nullptr);
+    size_t taskbarRowsPerColumn = 2;
     Controls::ColumnDefinition column{nullptr};
     Controls::ColumnDefinition implicitOriginalColumn{nullptr};
     std::vector<ShiftedChild> shifted;
@@ -1441,7 +1489,7 @@ struct NativePanel {
                 definition.Height(GridLength{1, GridUnitType::Auto});
                 overviewTable.RowDefinitions().Append(definition);
             }
-            const std::array<const wchar_t*, 3> headers{L"参数", L"当前值", L"峰值 / 最低↓"};
+            const std::array<const wchar_t*, 3> headers{L"参数", L"当前值", L"近 1h 最值"};
             const auto makeCells = [&](size_t rowIndex, size_t group) {
                 std::array<Controls::TextBlock, 3> cells;
                 for (size_t j = 0; j < cells.size(); ++j) {
@@ -1476,8 +1524,12 @@ struct NativePanel {
             cells[2].Text(row.peak);
             Controls::ToolTipService::SetToolTip(cells[1], winrt::box_value(row.state));
             Automation::AutomationProperties::SetHelpText(cells[1], row.state);
+            const auto extremeHelp = row.minimum ? L"近 1 小时最低值" : L"近 1 小时最高值";
+            Controls::ToolTipService::SetToolTip(cells[2], winrt::box_value(extremeHelp));
+            Automation::AutomationProperties::SetHelpText(cells[2], extremeHelp);
             Controls::ToolTipService::SetToolTip(cells[0], winrt::box_value(
-                row.label + L"\n" + latest.devices + L"\n峰值仅记录本次运行；温度阈值可在设置中调整。"));
+                row.label + L"\n" + latest.devices +
+                L"\n最值统计最近 1 小时；运行不足 1 小时时按已有有效样本统计。"));
             for (size_t j = 0; j < cells.size(); ++j)
                 cells[j].Foreground(TextBrush(j < 2 ? row.severity : Severity::Normal));
         }
@@ -1670,7 +1722,7 @@ struct NativePanel {
             Controls::Grid::SetColumn(row.value, 3);
             row.grid.Children().Append(row.icon);
             row.grid.Children().Append(row.value);
-            columnPanels[index / 2].Children().Append(row.grid);
+            columnPanels[index / taskbarRowsPerColumn].Children().Append(row.grid);
         }
 
         operation = L"Insert native column";
@@ -1779,11 +1831,19 @@ struct NativePanel {
             return;
         }
         ShiftNewChildren();
+        const size_t rowsPerColumn = AlertRowsPerColumn(items.size());
+        if (taskbarRowsPerColumn != rowsPerColumn) {
+            operation = L"Reflow alert rows";
+            for (auto& panel : columnPanels) panel.Children().Clear();
+            taskbarRowsPerColumn = rowsPerColumn;
+            for (size_t index = 0; index < rows.size(); ++index)
+                columnPanels[index / taskbarRowsPerColumn].Children().Append(rows[index].grid);
+        }
         // Measure as a visible subtree. A child of a collapsed ancestor may
         // report zero desired width even when Measure is called explicitly.
         root.Visibility(Visibility::Visible);
         for (size_t i = 0; i < columnPanels.size(); ++i) {
-            columnPanels[i].Visibility(i * 2 < items.size() ? Visibility::Visible : Visibility::Collapsed);
+            columnPanels[i].Visibility(i * rowsPerColumn < items.size() ? Visibility::Visible : Visibility::Collapsed);
             columnPanels[i].Margin(Thickness{0, 0, i > 0 ? static_cast<double>(g_settings.alertColumnGap.load()) : 0, 0});
         }
         double valueWidth = 0;
@@ -1798,11 +1858,13 @@ struct NativePanel {
             row.grid.Visibility(Visibility::Visible);
             row.grid.Height(metrics->height);
             row.grid.Margin(Thickness{0, 0, 0,
-                index % 2 == 0 && index + 1 < items.size() ? metrics->gap : 0});
+                index % rowsPerColumn + 1 < rowsPerColumn && index + 1 < items.size()
+                    ? metrics->gap : 0});
             row.icon.Width(metrics->iconSize);
             row.icon.Height(metrics->iconSize);
             row.iconColumn.Width(GridLength{metrics->iconSize, GridUnitType::Pixel});
-            row.gapColumn.Width(GridLength{static_cast<double>(g_settings.iconValueGap.load()), GridUnitType::Pixel});
+            const double itemScale = rowsPerColumn == 3 ? 0.84 : 1.0;
+            row.gapColumn.Width(GridLength{std::floor(g_settings.iconValueGap.load() * itemScale), GridUnitType::Pixel});
             operation = L"Set vector icon";
             if (row.kind != item.kind) {
                 // Geometry cannot be shared/reparented between live Path controls
@@ -1817,7 +1879,7 @@ struct NativePanel {
             row.value.Foreground(brush);
             row.value.FontSize(metrics->fontSize);
             row.value.Text(item.value);
-            row.grid.MinWidth(g_settings.itemWidth.load());
+            row.grid.MinWidth(std::ceil(g_settings.itemWidth.load() * itemScale));
             if (!item.label.empty()) Controls::ToolTipService::SetToolTip(row.grid,
                 winrt::box_value(item.label + L" · " + item.value + L"\n点击查看总表"));
             else row.grid.ClearValue(Controls::ToolTipService::ToolTipProperty());
@@ -1830,9 +1892,10 @@ struct NativePanel {
             valueWidth = std::max<double>(valueWidth, rows[index].value.DesiredSize().Width);
         }
         operation = L"Align native text columns";
+        const double itemScale = rowsPerColumn == 3 ? 0.84 : 1.0;
         for (auto& row : rows) {
             row.valueColumn.Width(GridLength{std::ceil(valueWidth) + 1, GridUnitType::Pixel});
-            row.grid.MinWidth(g_settings.itemWidth.load());
+            row.grid.MinWidth(std::ceil(g_settings.itemWidth.load() * itemScale));
         }
         root.Margin(Thickness{2, 0, static_cast<double>(g_settings.componentGap.load()), 0});
         root.Visibility(Visibility::Visible);
@@ -2168,6 +2231,7 @@ void ReleaseWorkerHandles() {
 BOOL Wh_ModInit() {
     LoadSettings();
     ResetTrackers();
+    g_extrema.clear();
     g_updateMessage = RegisterWindowMessageW(L"Windhawk.SystemResourceAlert.Update.0.4");
     g_dispatchMessage = RegisterWindowMessageW(L"Windhawk.SystemResourceAlert.Dispatch.0.4");
     if (!g_updateMessage || !g_dispatchMessage || !ResolveTaskbarAccessors()) {
