@@ -2,7 +2,7 @@
 
 Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时显示透明的「图标 + 数值」，点击后展开圆角资源总表。
 
-**版本：0.8.1 · 许可证：GPL-3.0-only · 平台：Windows 11 x64**
+**版本：0.8.2 · 许可证：GPL-3.0-only · 平台：Windows 11 x64**
 
 ![原生资源总表、GPU 独立折叠与三项单列告警布局](docs/resource-overview.jpg)
 
@@ -15,11 +15,11 @@ Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时
 - 告警位于系统托盘左侧。恰好三项时缩小内容并放在一列；四项及以上恢复每列上下两项，向左扩展。
 - 使用原生 XAML 文本与矢量图标，保留抗锯齿。任务栏内无底色，不创建独立悬浮窗口。
 - 没有告警时完全隐藏，不保留入口图标、不占任务栏空间。
-- 点击告警打开三列表格：参数、当前值、近 1h 最值。严重、告警和确认中的项目优先。
+- 点击告警打开三列表格：参数、当前值、近 15 min 最值。严重、告警和确认中的项目优先。
 - 有对应图标的参数会在名称前显示图标。每张物理 GPU 有独立折叠行；折叠时只显示该卡的负载、专用显存和温度，展开后显示完整读数，多张显卡互不混合。
-- 无法读取或过期的数据不列入表格。整表无需滚动或翻页；内容过多时并排排列，极小工作区下按需缩放。
-- 最值使用滚动一小时的有效采样：磁盘可用空间取最低值，其他参数取最高值，不再附加最低值箭头。窗口到期的样本自动移出。
-- 运行不足一小时时只统计已有数据；数据仅保存在内存中，不生成历史文件。
+- 无法读取或过期的数据不列入表格。三列内容保持单行、不换行；整表无需滚动或翻页，内容过多时并排排列，极小工作区下按需整体缩放。
+- 最值使用滚动 15 分钟的有效采样：磁盘可用空间取最低值，其他参数取最高值，不再附加最低值箭头。窗口到期的样本自动移出。
+- 运行不足 15 分钟时只统计已有数据；数据仅保存在内存中，不生成历史文件。
 - 系统盘活动率达到 90% 会累计繁忙时间；写入达到 5 MiB/s 会累计持续写盘时间。两者允许最多 5 秒短暂回落，分别累计 60 秒和 180 秒后告警。读取速度仅作诊断；写入规则用于发现持续后台流量，不代表磁盘健康或性能上限。
 
 图标含义：芯片 = CPU，内存条 = 物理内存，带加号的文档 = 提交内存，硬盘 = 剩余空间，仪表 = 磁盘活动率，向下箭头 = 持续写入，显示器 = GPU，内存芯片 = 专用显存，温度计 = 温度。小尺寸下不再拼接两个设备图案。
@@ -99,6 +99,6 @@ Windows 11 任务栏系统资源告警组件。仅在资源持续超出阈值时
 
 ## English summary
 
-A native Windhawk resource-alert component for the Windows 11 x64 taskbar. It displays only sustained alerts and hides completely when healthy. CPU load, system-drive active time, and sustained writes use accumulated-duration rules with short-gap tolerance. Microsoft Fluent UI System Icons improve recognition at taskbar size. Exactly three alerts use one compact three-row column; four or more use normal two-row columns. Click an alert for a rounded, non-scrolling overview with rolling one-hour extrema, parameter icons, and independently collapsible per-GPU summaries. The JPEG demonstration image uses simulated data.
+A native Windhawk resource-alert component for the Windows 11 x64 taskbar. It displays only sustained alerts and hides completely when healthy. CPU load, system-drive active time, and sustained writes use accumulated-duration rules with short-gap tolerance. Microsoft Fluent UI System Icons improve recognition at taskbar size. Exactly three alerts use one compact three-row column; four or more use normal two-row columns. Click an alert for a rounded, non-scrolling overview with rolling fifteen-minute extrema, parameter icons, and independently collapsible per-GPU summaries. The JPEG demonstration image uses simulated data.
 
 Install by copying the complete `.wh.cpp` file into Windhawk's new-mod editor and pressing Ctrl+B. GPU/temperature support depends on the driver and optional local sensor providers. No telemetry or cloud-upload code is included. See [privacy details](PRIVACY.md) and [third-party attribution](THIRD_PARTY_NOTICES.md).

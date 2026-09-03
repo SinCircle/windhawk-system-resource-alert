@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.8.1
+// @version         0.8.2
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -57,14 +57,15 @@ Microsoft Fluent UI System Icons vector paths provide antialiasing without a
 bitmap or colored background.
 
 Click any alert to open a rounded native, light-dismiss
-flyout with three columns: parameter, current value, and rolling one-hour extremum.
+flyout with three columns: parameter, current value, and rolling fifteen-minute extremum.
 There is no title/timestamp block or threshold/status column. Critical,
 warning, and pending rows sort before normal rows; confirmed alerts are colored.
 Unavailable/stale readings are omitted from the table, not displayed as zero.
 Hover a current value for its status or a parameter for device/source details.
-All readable rows are shown at once, without scrolling or pagination. The card
-grows to its content and splits long tables into adjacent groups. On unusually
-small screens it scales down only as needed to remain inside the work area.
+All readable rows are shown at once, without scrolling or pagination. Cells
+stay on one line; the wider card grows to its content and splits long tables
+into adjacent groups. On unusually small screens it scales down only as needed
+to remain inside the work area.
 Rows with a resource icon show it before the parameter name. Each physical GPU
 has its own collapsible summary row (load, dedicated VRAM, and temperature);
 expanding one GPU never mixes its readings or state with another adapter.
@@ -74,7 +75,7 @@ accumulates; by default, dips below 5 MiB/s of at most five seconds keep the
 episode alive and 180 accumulated seconds trigger a warning. Read throughput
 remains diagnostic because storage devices differ greatly.
 The table refreshes while open. Extrema cover available samples from the most
-recent hour (or the shorter time since startup) and remain in memory only; free
+recent fifteen minutes (or the shorter time since startup) and remain in memory only; free
 disk space records its minimum while other metrics record their maximum. No
 arrow is appended to minimum values. Hiding an unavailable table row does
 not confirm recovery from a previous alert: that alert remains until a valid
@@ -404,7 +405,7 @@ UINT g_dispatchMessage = 0;
 std::mutex g_snapshotMutex;
 RuntimeSnapshot g_snapshot;
 std::map<std::wstring, std::array<AlertTracker, 3>> g_gpuTrackers;
-constexpr ULONGLONG kExtremumWindowMs = 60ULL * 60 * 1000;
+constexpr ULONGLONG kExtremumWindowMs = 15ULL * 60 * 1000;
 struct ExtremumSample { ULONGLONG tick; double value; };
 struct RollingExtremum {
     bool minimum = false;
@@ -1772,16 +1773,17 @@ struct NativePanel {
             overviewKeys.clear();
             overviewRowsPerGroup = rowsPerGroup;
             overviewGroupCount = groups;
-            overviewTable.Width(groups * 448.0 + (groups - 1) * 16.0);
+            constexpr double kOverviewGroupWidth = 720.0;
+            overviewTable.Width(groups * kOverviewGroupWidth + (groups - 1) * 16.0);
             for (size_t group = 0; group < groups; ++group) {
                 if (group) {
                     Controls::ColumnDefinition spacer;
                     spacer.Width(GridLength{16, GridUnitType::Pixel});
                     overviewTable.ColumnDefinitions().Append(spacer);
                 }
-                for (double weight : {1.3, 1.8, 1.0}) {
+                for (double width : {150.0, 300.0, 270.0}) {
                     Controls::ColumnDefinition definition;
-                    definition.Width(GridLength{weight, GridUnitType::Star});
+                    definition.Width(GridLength{width, GridUnitType::Pixel});
                     overviewTable.ColumnDefinitions().Append(definition);
                 }
             }
@@ -1790,7 +1792,7 @@ struct NativePanel {
                 definition.Height(GridLength{1, GridUnitType::Auto});
                 overviewTable.RowDefinitions().Append(definition);
             }
-            const std::array<const wchar_t*, 3> headers{L"参数", L"当前值", L"近 1h 最值"};
+            const std::array<const wchar_t*, 3> headers{L"参数", L"当前值", L"近 15 min 最值"};
             const auto makeCells = [&](size_t rowIndex, size_t group,
                                        const OverviewRow* data = nullptr) {
                 std::array<Controls::TextBlock, 3> cells;
@@ -1798,7 +1800,8 @@ struct NativePanel {
                     auto& text = cells[j];
                     text.FontSize(12);
                     text.IsTextScaleFactorEnabled(false);
-                    text.TextWrapping(TextWrapping::Wrap);
+                    text.TextWrapping(TextWrapping::NoWrap);
+                    text.TextTrimming(TextTrimming::None);
                     text.VerticalAlignment(VerticalAlignment::Center);
                     text.Margin(Thickness{0, 4, j + 1 == cells.size() ? 0.0 : 8.0, 4});
                     text.Foreground(TextBrush());
@@ -1883,12 +1886,12 @@ struct NativePanel {
             cells[2].Text(row.peak);
             Controls::ToolTipService::SetToolTip(cells[1], winrt::box_value(row.state));
             Automation::AutomationProperties::SetHelpText(cells[1], row.state);
-            const auto extremeHelp = row.minimum ? L"近 1 小时最低值" : L"近 1 小时最高值";
+            const auto extremeHelp = row.minimum ? L"近 15 分钟最低值" : L"近 15 分钟最高值";
             Controls::ToolTipService::SetToolTip(cells[2], winrt::box_value(extremeHelp));
             Automation::AutomationProperties::SetHelpText(cells[2], extremeHelp);
             Controls::ToolTipService::SetToolTip(cells[0], winrt::box_value(
                 row.label + L"\n" + latest.devices +
-                L"\n最值统计最近 1 小时；运行不足 1 小时时按已有有效样本统计。"));
+                L"\n最值统计最近 15 分钟；运行不足 15 分钟时按已有有效样本统计。"));
             for (size_t j = 0; j < cells.size(); ++j)
                 cells[j].Foreground(TextBrush(j < 2 ? row.severity : Severity::Normal));
             overviewExpanders[i].Foreground(TextBrush(row.severity));
