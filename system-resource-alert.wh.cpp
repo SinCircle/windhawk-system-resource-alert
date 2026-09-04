@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.8.3
+// @version         0.8.4
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -58,6 +58,8 @@ bitmap or colored background.
 
 Click any alert to open a rounded native, light-dismiss
 flyout with three columns: parameter, current value, and rolling fifteen-minute extremum.
+Its tray-side edge follows the alert column horizontally, while its bottom edge
+keeps the native flyout gap above the taskbar instead of following alert-row height.
 There is no title/timestamp block or threshold/status column. Critical,
 warning, and pending rows sort before normal rows; confirmed alerts are colored.
 Unavailable/stale readings are omitted from the table, not displayed as zero.
@@ -2011,7 +2013,10 @@ struct NativePanel {
         host = grid;
         root = Controls::Grid();
         root.Name(kComponentName);
-        root.VerticalAlignment(VerticalAlignment::Center);
+        // Fill the taskbar cell so FlyoutPlacementMode::TopEdgeAlignedRight
+        // always anchors to the taskbar's top edge. The visible alert stacks
+        // stay centered independently below.
+        root.VerticalAlignment(VerticalAlignment::Stretch);
         root.HorizontalAlignment(HorizontalAlignment::Right);
         // Alpha-zero fill creates a complete click target without a visible box.
         root.Background(Media::SolidColorBrush(winrt::Windows::UI::Color{0,0,0,0}));
@@ -2034,7 +2039,7 @@ struct NativePanel {
             auto& stack = columnPanels[index];
             stack = Controls::StackPanel();
             stack.Orientation(Controls::Orientation::Vertical);
-            stack.VerticalAlignment(VerticalAlignment::Top);
+            stack.VerticalAlignment(VerticalAlignment::Center);
             Controls::Grid::SetColumn(stack, static_cast<int>(kMaxColumns - 1 - index));
             root.Children().Append(stack);
         }
@@ -2189,6 +2194,8 @@ struct NativePanel {
             root.Visibility(Visibility::Collapsed);
             return;
         }
+        operation = L"Pin flyout anchor to taskbar height";
+        root.MinHeight(taskbarHeight);
         ShiftNewChildren();
         const size_t rowsPerColumn = AlertRowsPerColumn(items.size());
         if (taskbarRowsPerColumn != rowsPerColumn) {
