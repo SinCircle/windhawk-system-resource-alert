@@ -2,11 +2,11 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-*Version 0.8.4 · GPL-3.0-only · Windows 11 x64*
+*Version 0.8.5 · GPL-3.0-only · Windows 11 x64*
 
 Resource alerts for the Windows 11 taskbar. When any metric stays past its threshold — CPU, memory, disk, GPU, or temperature — a transparent **icon + value** appears beside the system tray. Clicking it opens a rounded overview panel with the full readings.
 
-![Native overview, taskbar alerts and per-GPU rows on a 4K desktop](docs/resource-overview-v0.8.4-desktop-4k.jpg)
+![Native overview, taskbar alerts and per-GPU rows on a 4K desktop](docs/resource-overview-v0.8.5-desktop-4k.jpg)
 
 ## Monitored metrics
 
@@ -23,7 +23,7 @@ Rows are omitted when sensor data is missing or stale.
 - With nothing alerting, the taskbar is left untouched: no entry icon, no reserved space.
 - Clicking an alert opens the overview as a three-column table (parameter, current value, worst value in the last 15 minutes), with critical and warning entries first. Rows stay on a single line and the panel adjusts its width to the longest entry; a large number of rows is arranged side by side instead of scrolling.
 - Extrema are taken from a rolling 15-minute window of valid samples: free space keeps the low value, other metrics the high. Until the window fills, the available samples are used. Data exists in memory only; no history file is written.
-- Each GPU has a collapsible row: load / VRAM / temperature when collapsed, the full readout when expanded.
+- Each GPU has a collapsible row: load and VRAM when collapsed, with temperature and the remaining readings available after expansion.
 
 Icons: chip = CPU, RAM stick = physical memory, document with a plus = committed memory, drive = free space, gauge = disk activity, down arrow = sustained write, monitor = GPU, memory chip = VRAM, thermometer = temperature.
 

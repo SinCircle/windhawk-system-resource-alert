@@ -2,7 +2,7 @@
 // @id              system-resource-alert
 // @name            System Resource Alert for Taskbar
 // @description     Native taskbar resource alerts: two rows per column, expanding left before the system tray.
-// @version         0.8.4
+// @version         0.8.5
 // @author          SinCircle
 // @github          https://github.com/SinCircle
 // @homepage        https://github.com/SinCircle/windhawk-system-resource-alert
@@ -69,7 +69,8 @@ stay on one line; the wider card grows to its content and splits long tables
 into adjacent groups. On unusually small screens it scales down only as needed
 to remain inside the work area.
 Rows with a resource icon show it before the parameter name. Each physical GPU
-has its own collapsible summary row (load, dedicated VRAM, and temperature);
+has its own collapsible summary row (load and dedicated VRAM; temperature stays
+available in the expanded detail rows);
 expanding one GPU never mixes its readings or state with another adapter.
 CPU and disk active-time warning durations accumulate across brief dips below
 their thresholds. System-drive write time above the configured rate also
@@ -1480,7 +1481,7 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
         const auto join = [](const std::vector<std::wstring>& parts) {
             std::wstring result;
             for (const auto& part : parts) {
-                if (!result.empty()) result += L" · ";
+                if (!result.empty()) result += L" ";
                 result += part;
             }
             return result.empty() ? std::wstring(L"--") : result;
@@ -1499,10 +1500,6 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
             currentParts.push_back(L"显存 " + FormatPercent(gpu.VramPct()));
             peakParts.push_back(L"显存 " + rowPeak(gpu.id + L"vram"));
         }
-        if (gpu.temperature >= 0) {
-            currentParts.push_back(L"温度 " + FormatNumber(gpu.temperature, L" °C", 0));
-            peakParts.push_back(L"温度 " + rowPeak(gpu.id + L"temp"));
-        }
         const Severity summaryDisplayed = std::max({trackers[0].displayed,
             trackers[1].displayed, trackers[2].displayed});
         const Severity summaryRaw = std::max({
@@ -1510,7 +1507,9 @@ RuntimeSnapshot BuildSnapshot(ULONGLONG tick = GetTickCount64()) {
             VramSeverity(gpu),
             ThresholdSeverity(gpu.temperature, g_settings.gpuTemperatureWarning,
                               g_settings.gpuTemperatureCritical)});
-        const bool summaryAvailable = !currentParts.empty();
+        // Keep the group expandable when temperature is the only available
+        // GPU reading, but don't put temperature in the collapsed summary.
+        const bool summaryAvailable = !currentParts.empty() || gpu.temperature >= 0;
         const std::wstring summaryState = !summaryAvailable ? L"不可用" :
             summaryDisplayed == Severity::Critical ? L"严重" :
             summaryDisplayed == Severity::Warning ? L"告警" :
